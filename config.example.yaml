@@ -1,0 +1,29 @@
+esp32:
+  baud: 115200
+  mode: stream       # stream or poll
+  rate_hz: 50
+
+mini45:
+  mode: netft        # netft or simulator
+  ip: 192.168.1.1
+  port: 49152
+  rate_hz: 200
+  force_counts_per_unit: 1000000
+  torque_counts_per_unit: 1000000
+  force_signs: [1, 1, 1]
+  torque_signs: [1, 1, 1]
+
+stability:
+  stable_window_s: 2.0
+  hold_window_s: 5.0
+  target_force_std_max_n: 0.03
+  target_force_std_percent_fs: 0.01
+  cross_axis_ratio_max: 0.10
+  capacitance_jump_max_pf: 0.05
+  torque_abs_max: 1.0
+
+safety:
+  fx_abs_max_n: 4.0
+  fy_abs_max_n: 4.0
+  fz_abs_max_n: 10.0
+  stale_timeout_s: 1.0

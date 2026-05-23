@@ -1,0 +1,28 @@
+# Python 缓存与测试缓存
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 本地依赖环境
+.deps_py39/
+.venv/
+venv/
+env/
+
+# IDE / 编辑器配置
+.idea/
+.vscode/
+
+# 标定实验输出数据
+runs/
+*.csv
+*.log
+
+# 本地配置与临时文件
+config.yaml
+*.tmp
+*.bak
+
+# 实拍图与本地实验照片，不作为代码仓库内容上传
+mini45标定台/

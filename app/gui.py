@@ -1,0 +1,1525 @@
+from __future__ import annotations
+
+import queue
+import time
+from pathlib import Path
+
+try:
+    import serial.tools.list_ports
+except ImportError:  # pragma: no cover
+    serial = None
+
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QPlainTextEdit,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+import pyqtgraph as pg
+
+from .buffers import SampleBuffer
+from .calibration import (
+    CalibrationTarget,
+    TrainingSegment,
+    choose_control_axis,
+    generate_training_trajectory,
+    generate_fz_sequence,
+    generate_shear_sequence,
+    parse_force_levels,
+)
+from .arduino_motion import (
+    ArduinoMotionAdapter,
+    AUTO_DEFAULT_GAIN_MM_PER_N,
+    AUTO_DEFAULT_INTERVAL_S,
+    AUTO_DEFAULT_MAX_STEP_MM,
+    AUTO_DEFAULT_MIN_STEP_MM,
+    AUTO_DEFAULT_SPEED_MM_S,
+    AUTO_MIN_PULSES,
+    DEFAULT_FORCE_TO_MOTOR,
+    DEFAULT_FORCE_TO_MOTOR_SIGN,
+    MANUAL_DEFAULT_SPEED_MM_S,
+    MANUAL_DEFAULT_STEP_MM,
+    MM_PER_PULSE,
+    MotionMessage,
+    PULSES_PER_MM,
+    PULSES_PER_REV,
+    SCREW_LEAD_MM,
+    adaptive_force_step_mm,
+    mapped_motor_delta,
+    mm_to_pulses,
+    parse_axis_position,
+)
+from .esp32_serial import Esp32Log, Esp32SerialAdapter
+from .mini45_netft import Mini45Log, Mini45NetFTAdapter, Mini45Simulator, fetch_netft_config
+from .models import (
+    CapSample,
+    CombinedSnapshot,
+    ExperimentMeta,
+    ForceSample,
+    SafetySettings,
+    StabilitySettings,
+)
+from .recorder import CsvRecorder
+from .stability import build_calibration_point, evaluate_three_axis_stability
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mini45 + ESP32/MC1081 三维力标定上位机")
+        self.resize(1280, 860)
+
+        self.buffer = SampleBuffer(max_seconds=600)
+        self.esp32 = None
+        self.mini45 = None
+        self.motion: ArduinoMotionAdapter | None = None
+        self.recorder: CsvRecorder | None = None
+        self.marker_id = 0
+        self.last_force_time = 0.0
+        self.last_cap_time = 0.0
+        self.latest_force_sample: ForceSample | None = None
+        self.motion_positions = {"X": None, "Y": None, "Z": None}
+        self.auto_force_active = False
+        self.auto_force_holding = False
+        self.auto_force_marker_done = False
+        self.auto_force_in_window_since = 0.0
+        self.auto_force_last_move = 0.0
+        self.auto_force_next_move_time = 0.0
+        self.motion_last_query = 0.0
+        self.calibration_mode = ""
+        self.calibration_paused = False
+        self.sequence_targets: list[CalibrationTarget] = []
+        self.sequence_index = 0
+        self.active_target: CalibrationTarget | None = None
+        self.current_cycle_id = "cycle_001"
+        self.zero_drift_count = 0
+        self.zero_drift_active = False
+        self.zero_drift_start_s = 0.0
+        self.zero_drift_samples: list[CombinedSnapshot] = []
+        self.zero_drift_file = ""
+        self.training_count = 0
+        self.training_active = False
+        self.training_segments: list[TrainingSegment] = []
+        self.training_segment_index = 0
+        self.training_segment_start_s = 0.0
+        self.training_current_segment: TrainingSegment | None = None
+        self.training_pause_started_s = 0.0
+
+        self.force_x: list[float] = []
+        self.force_y = {key: [] for key in ("fx", "fy", "fz")}
+        self.cap_x: list[float] = []
+        self.cap_y = {key: [] for key in ("c0", "c1", "c2", "c3", "c4")}
+
+        self._build_ui()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(50)
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        conn = QHBoxLayout()
+        conn.addWidget(self._build_esp32_group(), stretch=1)
+        conn.addWidget(self._build_mini45_group(), stretch=1)
+        conn.addWidget(self._build_motion_group(), stretch=1)
+        layout.addLayout(conn)
+
+        layout.addWidget(self._build_calibration_group())
+
+        status_plots = QHBoxLayout()
+        status_plots.addWidget(self._build_status_group(), stretch=1)
+        status_plots.addWidget(self._build_record_group(), stretch=1)
+        layout.addLayout(status_plots)
+
+        plot_layout = QHBoxLayout()
+        self.force_plot = pg.PlotWidget(title="Mini45 力数据")
+        self.force_plot.setBackground("w")
+        self.force_plot.addLegend()
+        self.force_curves = {
+            "fx": self.force_plot.plot([], [], pen=pg.mkPen("r", width=2), name="Fx"),
+            "fy": self.force_plot.plot([], [], pen=pg.mkPen("g", width=2), name="Fy"),
+            "fz": self.force_plot.plot([], [], pen=pg.mkPen("b", width=2), name="Fz"),
+        }
+        self.cap_plot = pg.PlotWidget(title="五通道电容 C0-C4")
+        self.cap_plot.setBackground("w")
+        self.cap_plot.addLegend()
+        colors = {"c0": "r", "c1": "g", "c2": "b", "c3": "m", "c4": "k"}
+        self.cap_curves = {
+            key: self.cap_plot.plot([], [], pen=pg.mkPen(color, width=2), name=key.upper())
+            for key, color in colors.items()
+        }
+        plot_layout.addWidget(self.force_plot)
+        plot_layout.addWidget(self.cap_plot)
+        layout.addLayout(plot_layout, stretch=1)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.document().setMaximumBlockCount(1000)
+        layout.addWidget(self.log)
+
+    def _build_esp32_group(self) -> QGroupBox:
+        box = QGroupBox("ESP32 / MC1081 电容采集")
+        form = QFormLayout(box)
+        row = QHBoxLayout()
+        self.esp_port = QComboBox()
+        self.refresh_ports()
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        row.addWidget(self.esp_port, stretch=1)
+        row.addWidget(self.refresh_btn)
+        form.addRow("串口", row)
+
+        self.esp_baud = QComboBox()
+        self.esp_baud.addItems(["115200", "921600"])
+        form.addRow("波特率", self.esp_baud)
+        self.esp_mode = QComboBox()
+        self.esp_mode.addItem("流式采集", "stream")
+        self.esp_mode.addItem("定时轮询", "poll")
+        form.addRow("采集模式", self.esp_mode)
+        self.esp_rate = QSpinBox()
+        self.esp_rate.setRange(1, 200)
+        self.esp_rate.setValue(50)
+        form.addRow("频率 Hz", self.esp_rate)
+        self.esp_btn = QPushButton("连接 ESP32")
+        self.esp_btn.clicked.connect(self.toggle_esp32)
+        form.addRow(self.esp_btn)
+        return box
+
+    def _build_mini45_group(self) -> QGroupBox:
+        box = QGroupBox("Mini45 / NETBA 力传感器")
+        form = QFormLayout(box)
+        self.mini_mode = QComboBox()
+        self.mini_mode.addItem("模拟器", "simulator")
+        self.mini_mode.addItem("NETBA / Net F/T", "netft")
+        form.addRow("模式", self.mini_mode)
+        self.mini_ip = QLineEdit("192.168.1.1")
+        form.addRow("IP 地址", self.mini_ip)
+        self.mini_port = QSpinBox()
+        self.mini_port.setRange(1, 65535)
+        self.mini_port.setValue(49152)
+        form.addRow("UDP 端口", self.mini_port)
+        self.force_scale = QDoubleSpinBox()
+        self.force_scale.setRange(1.0, 1_000_000_000.0)
+        self.force_scale.setDecimals(0)
+        self.force_scale.setValue(1_000_000.0)
+        form.addRow("力计数/单位", self.force_scale)
+        self.torque_scale = QDoubleSpinBox()
+        self.torque_scale.setRange(1.0, 1_000_000_000.0)
+        self.torque_scale.setDecimals(0)
+        self.torque_scale.setValue(1_000_000.0)
+        form.addRow("力矩计数/单位", self.torque_scale)
+        btns = QHBoxLayout()
+        self.mini_btn = QPushButton("连接 Mini45")
+        self.mini_btn.clicked.connect(self.toggle_mini45)
+        self.bias_btn = QPushButton("清零/偏置")
+        self.bias_btn.clicked.connect(self.bias_mini45)
+        self.read_scale_btn = QPushButton("读取系数")
+        self.read_scale_btn.clicked.connect(self.read_mini45_scales)
+        btns.addWidget(self.mini_btn)
+        btns.addWidget(self.bias_btn)
+        btns.addWidget(self.read_scale_btn)
+        form.addRow(btns)
+        self.mini_status = QLabel("Mini45 状态：未连接")
+        form.addRow(self.mini_status)
+        return box
+
+    def _build_motion_group(self) -> QGroupBox:
+        box = QGroupBox("Arduino 三轴电机")
+        form = QFormLayout(box)
+        form.addRow(
+            QLabel(
+                f"丝杆导程 {SCREW_LEAD_MM:g} mm/rev，{PULSES_PER_REV:g} pulse/rev，"
+                f"分辨率 {MM_PER_PULSE:.3f} mm/pulse"
+            )
+        )
+
+        port_row = QHBoxLayout()
+        self.motion_port = QComboBox()
+        self.motion_baud = QComboBox()
+        self.motion_baud.addItems(["115200", "230400"])
+        port_row.addWidget(self.motion_port, stretch=1)
+        port_row.addWidget(self.motion_baud)
+        form.addRow("串口/波特率", port_row)
+
+        btn_row = QHBoxLayout()
+        self.motion_btn = QPushButton("连接 Arduino")
+        self.motion_btn.clicked.connect(self.toggle_motion)
+        self.motion_pc_btn = QPushButton("上位机模式")
+        self.motion_pc_btn.clicked.connect(lambda: self.motion_set_mode("PC"))
+        self.motion_manual_btn = QPushButton("摇杆模式")
+        self.motion_manual_btn.clicked.connect(lambda: self.motion_set_mode("MANUAL"))
+        btn_row.addWidget(self.motion_btn)
+        btn_row.addWidget(self.motion_pc_btn)
+        btn_row.addWidget(self.motion_manual_btn)
+        form.addRow(btn_row)
+
+        safe_row = QHBoxLayout()
+        self.motion_enable_btn = QPushButton("使能")
+        self.motion_enable_btn.clicked.connect(lambda: self.motion_enable(True))
+        self.motion_disable_btn = QPushButton("失能")
+        self.motion_disable_btn.clicked.connect(lambda: self.motion_enable(False))
+        self.motion_stop_btn = QPushButton("急停")
+        self.motion_stop_btn.clicked.connect(self.motion_stop)
+        safe_row.addWidget(self.motion_enable_btn)
+        safe_row.addWidget(self.motion_disable_btn)
+        safe_row.addWidget(self.motion_stop_btn)
+        form.addRow(safe_row)
+
+        home_row = QHBoxLayout()
+        for axis in ("X", "Y", "Z", "ALL"):
+            btn = QPushButton(f"回零 {axis}")
+            btn.clicked.connect(lambda _checked=False, a=axis: self.motion_home(a))
+            home_row.addWidget(btn)
+        form.addRow(home_row)
+
+        map_grid = QGridLayout()
+        self.map_fx = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fx"])
+        self.map_fy = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fy"])
+        self.map_fz = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fz"])
+        self.sign_fx = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fx"])
+        self.sign_fy = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fy"])
+        self.sign_fz = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fz"])
+        for col, force_axis in enumerate(("Fx", "Fy", "Fz")):
+            map_grid.addWidget(QLabel(force_axis), 0, col)
+        for col, combo in enumerate((self.map_fx, self.map_fy, self.map_fz)):
+            map_grid.addWidget(combo, 1, col)
+        for col, combo in enumerate((self.sign_fx, self.sign_fy, self.sign_fz)):
+            map_grid.addWidget(combo, 2, col)
+        form.addRow("力轴->电机轴/符号", map_grid)
+
+        step_row = QHBoxLayout()
+        self.motion_force_axis = QComboBox()
+        self.motion_force_axis.addItems(["Fx", "Fy", "Fz"])
+        self.motion_force_axis.setCurrentText("Fz")
+        self.motion_step_mm = self._spin(MM_PER_PULSE, 5.0, MANUAL_DEFAULT_STEP_MM)
+        self.motion_step_mm.setSingleStep(MM_PER_PULSE)
+        self.motion_speed_mm_s = self._spin(0.001, 20.0, MANUAL_DEFAULT_SPEED_MM_S)
+        self.motion_speed_mm_s.setSingleStep(0.1)
+        step_row.addWidget(QLabel("力轴"))
+        step_row.addWidget(self.motion_force_axis)
+        step_row.addWidget(QLabel("步长mm"))
+        step_row.addWidget(self.motion_step_mm)
+        step_row.addWidget(QLabel("速度mm/s"))
+        step_row.addWidget(self.motion_speed_mm_s)
+        form.addRow(step_row)
+
+        move_row = QHBoxLayout()
+        self.motion_plus_btn = QPushButton("力轴正向小步")
+        self.motion_plus_btn.clicked.connect(lambda: self.motion_force_step(1))
+        self.motion_minus_btn = QPushButton("力轴负向小步")
+        self.motion_minus_btn.clicked.connect(lambda: self.motion_force_step(-1))
+        move_row.addWidget(self.motion_plus_btn)
+        move_row.addWidget(self.motion_minus_btn)
+        form.addRow(move_row)
+
+        self.motion_status = QLabel("电机状态：未连接")
+        form.addRow(self.motion_status)
+        self.refresh_ports()
+        return box
+
+    def _build_calibration_group(self) -> QGroupBox:
+        box = QGroupBox("标定控制")
+        layout = QVBoxLayout(box)
+
+        self.basic_group = QGroupBox("基础信息")
+        grid = QGridLayout(self.basic_group)
+        self.experiment_id = QLineEdit("sensor01_mount01")
+        self.note = QLineEdit()
+        self.experiment_mode = QComboBox()
+        self.experiment_mode.addItem("空载零点漂移", "zero")
+        self.experiment_mode.addItem("单目标点标定", "single")
+        self.experiment_mode.addItem("序列标定", "sequence")
+        self.experiment_mode.addItem("训练数据采集 / 连续组合加载", "combined")
+        self.load_axis = QComboBox()
+        self.load_axis.addItems(["Fx", "Fy", "Fz"])
+        self.load_axis.setCurrentText("Fz")
+        self.branch = QComboBox()
+        self.branch.addItem("加载", "loading")
+        self.branch.addItem("卸载", "unloading")
+        self.direction = QComboBox()
+        self.direction.addItem("无", "none")
+        self.direction.addItem("正向", "positive")
+        self.direction.addItem("负向", "negative")
+        grid.addWidget(QLabel("实验批次/安装编号"), 0, 0)
+        grid.addWidget(self.experiment_id, 0, 1)
+        grid.addWidget(QLabel("实验模式"), 0, 2)
+        grid.addWidget(self.experiment_mode, 0, 3)
+        self.load_axis_label = QLabel("加载轴")
+        self.branch_label = QLabel("分支")
+        self.direction_label = QLabel("方向")
+        grid.addWidget(self.load_axis_label, 1, 0)
+        grid.addWidget(self.load_axis, 1, 1)
+        grid.addWidget(self.branch_label, 1, 2)
+        grid.addWidget(self.branch, 1, 3)
+        grid.addWidget(self.direction_label, 2, 0)
+        grid.addWidget(self.direction, 2, 1)
+        grid.addWidget(QLabel("备注"), 2, 2)
+        grid.addWidget(self.note, 2, 3)
+        layout.addWidget(self.basic_group)
+
+        self.zero_group = QGroupBox("空载零点漂移参数")
+        form = QFormLayout(self.zero_group)
+        self.zero_duration_s = self._spin(1.0, 3600.0, 180.0)
+        self.zero_duration_s.setSingleStep(10.0)
+        form.addRow("零点采集时间 s", self.zero_duration_s)
+        layout.addWidget(self.zero_group)
+
+        self.target_group = QGroupBox("目标力与稳定判定")
+        grid = QGridLayout(self.target_group)
+        self.target_fx = self._spin(-20, 20, 0)
+        self.target_fy = self._spin(-20, 20, 0)
+        self.target_fz = self._spin(-20, 20, 0)
+        self.tol_fx = self._spin(0, 5, 0.10)
+        self.tol_fy = self._spin(0, 5, 0.10)
+        self.tol_fz = self._spin(0, 5, 0.10)
+        for row, name, target, tolerance in (
+            (0, "Fx", self.target_fx, self.tol_fx),
+            (1, "Fy", self.target_fy, self.tol_fy),
+            (2, "Fz", self.target_fz, self.tol_fz),
+        ):
+            grid.addWidget(QLabel(f"目标 {name}"), row, 0)
+            grid.addWidget(target, row, 1)
+            grid.addWidget(QLabel(f"容差 {name}"), row, 2)
+            grid.addWidget(tolerance, row, 3)
+        self.stable_window = self._spin(0.5, 20, 2.0)
+        self.hold_window = self._spin(0.5, 30, 5.0)
+        grid.addWidget(QLabel("稳定时间 s"), 3, 0)
+        grid.addWidget(self.stable_window, 3, 1)
+        grid.addWidget(QLabel("保持时间 s"), 3, 2)
+        grid.addWidget(self.hold_window, 3, 3)
+        layout.addWidget(self.target_group)
+
+        self.sequence_group = QGroupBox("序列标定参数")
+        grid = QGridLayout(self.sequence_group)
+        self.seq_fz_max = self._spin(0.0, 10.0, 9.0)
+        self.seq_fz_step = self._spin(0.1, 10.0, 1.0)
+        self.seq_shear_max = self._spin(0.0, 4.0, 3.6)
+        self.seq_shear_step = self._spin(0.1, 4.0, 0.6)
+        self.seq_cycles = QSpinBox()
+        self.seq_cycles.setRange(1, 20)
+        self.seq_cycles.setValue(3)
+        self.seq_shear_direction = QComboBox()
+        self.seq_shear_direction.addItem("正负都做", "both")
+        self.seq_shear_direction.addItem("正向", "positive")
+        self.seq_shear_direction.addItem("负向", "negative")
+        self.seq_fz_label = QLabel("法向最大/步长")
+        self.seq_shear_label = QLabel("剪切最大/步长")
+        grid.addWidget(self.seq_fz_label, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(self.seq_fz_max)
+        row.addWidget(self.seq_fz_step)
+        self.seq_fz_layout = row
+        grid.addLayout(row, 0, 1)
+        grid.addWidget(self.seq_shear_label, 0, 2)
+        row = QHBoxLayout()
+        row.addWidget(self.seq_shear_max)
+        row.addWidget(self.seq_shear_step)
+        self.seq_shear_layout = row
+        grid.addLayout(row, 0, 3)
+        grid.addWidget(QLabel("循环次数"), 1, 0)
+        grid.addWidget(self.seq_cycles, 1, 1)
+        self.seq_shear_direction_label = QLabel("剪切方向")
+        grid.addWidget(self.seq_shear_direction_label, 1, 2)
+        grid.addWidget(self.seq_shear_direction, 1, 3)
+        layout.addWidget(self.sequence_group)
+
+        self.closed_loop_group = QGroupBox("电机闭环参数")
+        grid = QGridLayout(self.closed_loop_group)
+        self.auto_interval_s = self._spin(0.05, 5.0, AUTO_DEFAULT_INTERVAL_S)
+        self.auto_interval_s.setSingleStep(0.05)
+        self.auto_min_step_mm = self._spin(MM_PER_PULSE, 1.0, AUTO_DEFAULT_MIN_STEP_MM)
+        self.auto_min_step_mm.setSingleStep(MM_PER_PULSE)
+        self.auto_step_mm = self._spin(MM_PER_PULSE, 2.0, AUTO_DEFAULT_MAX_STEP_MM)
+        self.auto_step_mm.setSingleStep(MM_PER_PULSE)
+        self.auto_gain_mm_per_n = self._spin(0.001, 1.0, AUTO_DEFAULT_GAIN_MM_PER_N)
+        self.auto_gain_mm_per_n.setSingleStep(0.005)
+        self.auto_speed_mm_s = self._spin(0.001, 20.0, AUTO_DEFAULT_SPEED_MM_S)
+        self.auto_speed_mm_s.setSingleStep(0.1)
+        grid.addWidget(QLabel("控制间隔 s"), 0, 0)
+        grid.addWidget(self.auto_interval_s, 0, 1)
+        grid.addWidget(QLabel("最小/最大步 mm"), 0, 2)
+        row = QHBoxLayout()
+        row.addWidget(self.auto_min_step_mm)
+        row.addWidget(self.auto_step_mm)
+        grid.addLayout(row, 0, 3)
+        grid.addWidget(QLabel("比例 mm/N"), 1, 0)
+        grid.addWidget(self.auto_gain_mm_per_n, 1, 1)
+        grid.addWidget(QLabel("速度 mm/s"), 1, 2)
+        grid.addWidget(self.auto_speed_mm_s, 1, 3)
+        layout.addWidget(self.closed_loop_group)
+
+        self.combined_group = QGroupBox("训练数据采集 / 连续组合加载")
+        form = QFormLayout(self.combined_group)
+        self.training_fz_levels = QLineEdit("3,5,7,9")
+        self.training_trajectory_type = QComboBox()
+        self.training_trajectory_type.addItem("Fx往返", "fx_roundtrip")
+        self.training_trajectory_type.addItem("Fy往返", "fy_roundtrip")
+        self.training_trajectory_type.addItem("斜向往返", "diagonal_roundtrip")
+        self.training_trajectory_type.addItem("圆形剪切", "circular_shear")
+        self.training_trajectory_type.addItem("随机小幅扰动", "random_perturb")
+        self.training_shear_max = self._spin(0.0, 4.0, 3.6)
+        self.training_force_rate = self._spin(0.01, 2.0, 0.2)
+        self.training_hold_s = self._spin(0.0, 60.0, 5.0)
+        self.training_recovery_s = self._spin(0.0, 120.0, 10.0)
+        form.addRow("Fz 层级 N", self.training_fz_levels)
+        form.addRow("轨迹类型", self.training_trajectory_type)
+        form.addRow("剪切最大力 N", self.training_shear_max)
+        form.addRow("力目标变化速率 N/s", self.training_force_rate)
+        form.addRow("端点保持时间 s", self.training_hold_s)
+        form.addRow("回零保持时间 s", self.training_recovery_s)
+        layout.addWidget(self.combined_group)
+
+        buttons = QHBoxLayout()
+        self.cal_start_btn = QPushButton("开始标定")
+        self.cal_start_btn.clicked.connect(self.start_calibration)
+        self.cal_pause_btn = QPushButton("暂停")
+        self.cal_pause_btn.clicked.connect(self.pause_calibration)
+        self.cal_resume_btn = QPushButton("继续")
+        self.cal_resume_btn.clicked.connect(self.resume_calibration)
+        self.cal_skip_btn = QPushButton("跳过当前点")
+        self.cal_skip_btn.clicked.connect(self.skip_calibration_point)
+        self.cal_stop_btn = QPushButton("停止/急停")
+        self.cal_stop_btn.clicked.connect(lambda: self.stop_calibration("人工停止"))
+        for button in (self.cal_start_btn, self.cal_pause_btn, self.cal_resume_btn, self.cal_skip_btn, self.cal_stop_btn):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.cal_status = QLabel("标定状态：空闲")
+        layout.addWidget(self.cal_status)
+        self.experiment_mode.currentIndexChanged.connect(self.update_calibration_mode_ui)
+        self.load_axis.currentIndexChanged.connect(self.update_calibration_mode_ui)
+        self.update_calibration_mode_ui()
+        return box
+
+    def _build_status_group(self) -> QGroupBox:
+        box = QGroupBox("实时状态")
+        grid = QGridLayout(box)
+        self.value_labels = {}
+        names = ["Fx", "Fy", "Fz", "Mx", "My", "Mz", "C0", "C1", "C2", "C3", "C4"]
+        for idx, name in enumerate(names):
+            grid.addWidget(QLabel(name), idx // 4, (idx % 4) * 2)
+            label = QLabel("--")
+            self.value_labels[name] = label
+            grid.addWidget(label, idx // 4, (idx % 4) * 2 + 1)
+        self.window_label = QLabel("目标窗口：--")
+        self.stable_label = QLabel("稳定状态：--")
+        self.safe_label = QLabel("安全状态：--")
+        grid.addWidget(self.window_label, 3, 0, 1, 2)
+        grid.addWidget(self.stable_label, 3, 2, 1, 2)
+        grid.addWidget(self.safe_label, 3, 4, 1, 2)
+        return box
+
+    def _build_record_group(self) -> QGroupBox:
+        box = QGroupBox("记录与导出")
+        form = QFormLayout(box)
+        out_row = QHBoxLayout()
+        self.output_dir = QLineEdit(str(Path.cwd() / "runs"))
+        browse = QPushButton("浏览")
+        browse.clicked.connect(self.choose_output_dir)
+        out_row.addWidget(self.output_dir)
+        out_row.addWidget(browse)
+        form.addRow("输出目录", out_row)
+        btns = QHBoxLayout()
+        self.record_btn = QPushButton("开始实验批次")
+        self.record_btn.clicked.connect(self.toggle_recording)
+        self.marker_btn = QPushButton("添加标记/标定点")
+        self.marker_btn.clicked.connect(self.add_marker)
+        btns.addWidget(self.record_btn)
+        btns.addWidget(self.marker_btn)
+        form.addRow(btns)
+        self.record_status = QLabel("未开始实验批次")
+        form.addRow(self.record_status)
+        return box
+
+    def _spin(self, minimum: float, maximum: float, value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setDecimals(3)
+        spin.setValue(value)
+        spin.setSingleStep(0.1)
+        return spin
+
+    def _motor_axis_combo(self, current: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(["X", "Y", "Z"])
+        combo.setCurrentText(current)
+        return combo
+
+    def _sign_combo(self, current: int) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("+", 1)
+        combo.addItem("-", -1)
+        combo.setCurrentIndex(0 if current >= 0 else 1)
+        return combo
+
+    def update_calibration_mode_ui(self) -> None:
+        mode = self._combo_value(self.experiment_mode)
+        axis = self.load_axis.currentText()
+        is_zero = mode == "zero"
+        is_single = mode == "single"
+        is_sequence = mode == "sequence"
+        is_combined = mode == "combined"
+        needs_motion = is_single or is_sequence or is_combined
+
+        for widget in (self.load_axis_label, self.load_axis):
+            widget.setVisible(is_single or is_sequence)
+        for widget in (self.branch_label, self.branch, self.direction_label, self.direction):
+            widget.setVisible(is_single)
+
+        self.zero_group.setVisible(is_zero)
+        self.target_group.setVisible(is_single or is_sequence)
+        self.sequence_group.setVisible(is_sequence)
+        self.closed_loop_group.setVisible(needs_motion)
+        self.combined_group.setVisible(is_combined)
+
+        shear_axis = axis in {"Fx", "Fy"}
+        for widget in (self.seq_fz_label, self.seq_fz_max, self.seq_fz_step):
+            widget.setVisible(is_sequence and axis == "Fz")
+        for widget in (self.seq_shear_label, self.seq_shear_max, self.seq_shear_step, self.seq_shear_direction_label, self.seq_shear_direction):
+            widget.setVisible(is_sequence and shear_axis)
+        self.cal_pause_btn.setVisible(needs_motion)
+        self.cal_resume_btn.setVisible(needs_motion)
+        self.cal_skip_btn.setVisible(is_sequence)
+
+    def refresh_ports(self) -> None:
+        current_esp = self.esp_port.currentText() if hasattr(self, "esp_port") else ""
+        current_motion = self.motion_port.currentText() if hasattr(self, "motion_port") else ""
+        try:
+            ports = [port.device for port in serial.tools.list_ports.comports()]
+        except Exception:
+            ports = []
+        if hasattr(self, "esp_port"):
+            self.esp_port.clear()
+            self.esp_port.addItems(ports)
+            if current_esp in ports:
+                self.esp_port.setCurrentText(current_esp)
+        if hasattr(self, "motion_port"):
+            self.motion_port.clear()
+            self.motion_port.addItems(ports)
+            if current_motion in ports:
+                self.motion_port.setCurrentText(current_motion)
+
+    def choose_output_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_dir.text())
+        if path:
+            self.output_dir.setText(path)
+
+    def toggle_esp32(self) -> None:
+        if self.esp32:
+            self.esp32.stop()
+            self.esp32 = None
+            self.esp_btn.setText("连接 ESP32")
+            self._log("ESP32 已断开")
+            return
+        port = self.esp_port.currentText()
+        if not port:
+            QMessageBox.warning(self, "ESP32", "未选择串口")
+            return
+        try:
+            self.esp32 = Esp32SerialAdapter(
+                port=port,
+                baud=int(self.esp_baud.currentText()),
+                mode=self._combo_value(self.esp_mode),
+                rate_hz=self.esp_rate.value(),
+            )
+            self.esp32.start()
+            self.esp_btn.setText("断开 ESP32")
+            self._log(f"ESP32 已连接：{port}")
+        except Exception as exc:
+            self.esp32 = None
+            QMessageBox.critical(self, "ESP32", str(exc))
+
+    def toggle_mini45(self) -> None:
+        if self.mini45:
+            self.mini45.stop()
+            self.mini45 = None
+            self.last_force_time = 0.0
+            self.mini_btn.setText("连接 Mini45")
+            self.mini_status.setText("Mini45 状态：未连接")
+            self._log("Mini45 已断开")
+            return
+        try:
+            mini_mode = self._combo_value(self.mini_mode)
+            if mini_mode == "simulator":
+                self.mini45 = Mini45Simulator(rate_hz=100)
+            else:
+                self.mini45 = Mini45NetFTAdapter(
+                    ip=self.mini_ip.text().strip(),
+                    port=self.mini_port.value(),
+                    force_counts_per_unit=self.force_scale.value(),
+                    torque_counts_per_unit=self.torque_scale.value(),
+            )
+            self.last_force_time = 0.0
+            self.mini45.start()
+            self.mini_btn.setText("断开 Mini45")
+            if mini_mode == "simulator":
+                self.mini_status.setText("Mini45 状态：模拟器已启动")
+                self._log("Mini45 模拟器已启动")
+            else:
+                self.mini_status.setText("Mini45 状态：已发送 RDT 启动命令，等待第一帧数据")
+                self._log("Mini45 已发送 RDT 启动命令，等待第一帧数据")
+        except Exception as exc:
+            self.mini45 = None
+            QMessageBox.critical(self, "Mini45", str(exc))
+
+    def read_mini45_scales(self) -> None:
+        ip = self.mini_ip.text().strip()
+        if not ip:
+            QMessageBox.warning(self, "Mini45", "请先填写 NETBA IP 地址")
+            return
+        try:
+            config = fetch_netft_config(ip)
+            if "cfgcpf" in config:
+                self.force_scale.setValue(float(config["cfgcpf"]))
+            if "cfgcpt" in config:
+                self.torque_scale.setValue(float(config["cfgcpt"]))
+            force_unit = config.get("scfgfu", "")
+            torque_unit = config.get("scfgtu", "")
+            rdt_rate = config.get("comrdtrate", "")
+            rdt_enabled = config.get("comrdte", "")
+            details = []
+            if force_unit:
+                details.append(f"力单位 {force_unit}")
+            if torque_unit:
+                details.append(f"力矩单位 {torque_unit}")
+            if rdt_rate:
+                details.append(f"RDT 频率 {rdt_rate} Hz")
+            if rdt_enabled:
+                details.append(f"RDT 启用状态 {rdt_enabled}")
+            self._log(f"已从 netftapi2.xml 读取系数：cfgcpf={config.get('cfgcpf', '未知')}，cfgcpt={config.get('cfgcpt', '未知')}；{'，'.join(details)}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Mini45", f"读取 NETBA 系数失败：{exc}")
+
+    def bias_mini45(self) -> None:
+        if self.mini45 and hasattr(self.mini45, "bias"):
+            self.mini45.bias()
+            self._log("Mini45 清零/偏置命令已发送")
+
+    def toggle_motion(self) -> None:
+        if self.motion:
+            self.stop_auto_force("Arduino 已断开")
+            self.motion.stop()
+            self.motion = None
+            self.motion_btn.setText("连接 Arduino")
+            self.motion_status.setText("电机状态：未连接")
+            self._log("Arduino 电机控制已断开")
+            return
+        port = self.motion_port.currentText()
+        if not port:
+            QMessageBox.warning(self, "Arduino 电机", "未选择串口")
+            return
+        try:
+            self.motion = ArduinoMotionAdapter(port=port, baud=int(self.motion_baud.currentText()))
+            self.motion.start()
+            self.motion_btn.setText("断开 Arduino")
+            self.motion_status.setText("电机状态：已连接，默认仍为摇杆模式")
+            self._log(f"Arduino 电机控制已连接：{port}")
+        except Exception as exc:
+            self.motion = None
+            QMessageBox.critical(self, "Arduino 电机", str(exc))
+
+    def motion_set_mode(self, mode: str) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "Arduino 电机", "请先连接 Arduino")
+            return
+        try:
+            self.motion.set_mode(mode)
+            text = "上位机模式" if mode == "PC" else "摇杆模式"
+            self.motion_status.setText(f"电机状态：已切换到{text}")
+            self._log(f"Arduino 已请求切换到{text}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Arduino 电机", str(exc))
+
+    def motion_enable(self, enabled: bool) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "Arduino 电机", "请先连接 Arduino")
+            return
+        try:
+            self.motion.enable(enabled)
+            self._log("Arduino 电机已请求使能" if enabled else "Arduino 电机已请求失能")
+        except Exception as exc:
+            QMessageBox.warning(self, "Arduino 电机", str(exc))
+
+    def motion_stop(self) -> None:
+        self.stop_auto_force("急停")
+        if not self.motion:
+            return
+        try:
+            self.motion.stop_all()
+            self._log("Arduino 电机急停命令已发送")
+        except Exception as exc:
+            QMessageBox.warning(self, "Arduino 电机", str(exc))
+
+    def motion_home(self, axis: str) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "Arduino 电机", "请先连接 Arduino")
+            return
+        try:
+            self.stop_auto_force("回零")
+            self.motion.home(axis)
+            self._log(f"Arduino 回零命令已发送：{axis}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Arduino 电机", str(exc))
+
+    def motion_force_step(self, direction: int) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "Arduino 电机", "请先连接 Arduino")
+            return
+        force_axis = self._combo_value(self.motion_force_axis)
+        motor_axis, delta_mm = mapped_motor_delta(
+            force_axis=force_axis,
+            force_error=float(direction),
+            step_mm=self.motion_step_mm.value(),
+            mapping=self.motion_mapping(),
+            signs=self.motion_signs(),
+            min_pulses=1,
+        )
+        try:
+            self.motion.set_mode("PC")
+            self.motion.enable(True)
+            self.motion.move_mm(motor_axis, delta_mm, self.motion_speed_mm_s.value())
+            self._log(
+                f"{force_axis} 小步移动：电机 {motor_axis} {delta_mm:+.4f} mm，"
+                f"{mm_to_pulses(delta_mm):+d} pulse"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Arduino 电机", str(exc))
+
+    def motion_mapping(self) -> dict[str, str]:
+        return {
+            "Fx": self.map_fx.currentText(),
+            "Fy": self.map_fy.currentText(),
+            "Fz": self.map_fz.currentText(),
+        }
+
+    def motion_signs(self) -> dict[str, int]:
+        return {
+            "Fx": int(self.sign_fx.currentData()),
+            "Fy": int(self.sign_fy.currentData()),
+            "Fz": int(self.sign_fz.currentData()),
+        }
+
+    def ensure_recording(self) -> bool:
+        if self.recorder:
+            return True
+        QMessageBox.warning(self, "实验批次", "请先点击“开始实验批次”，再开始当前子实验")
+        return False
+
+    def start_calibration(self) -> None:
+        mode = self._combo_value(self.experiment_mode)
+        if not self.ensure_recording():
+            return
+        if mode == "combined" and not self._training_devices_ready():
+            return
+        self.stop_auto_force("")
+        self.sequence_targets = []
+        self.sequence_index = 0
+        self.active_target = None
+        self.calibration_paused = False
+        self.calibration_mode = mode
+        if mode == "zero":
+            self.start_zero_drift()
+            return
+        if mode == "single":
+            self.current_cycle_id = "cycle_001"
+            self.active_target = CalibrationTarget(
+                axis=self._combo_value(self.load_axis),
+                direction=self._combo_value(self.direction),
+                branch=self._combo_value(self.branch),
+                target_fx=self.target_fx.value(),
+                target_fy=self.target_fy.value(),
+                target_fz=self.target_fz.value(),
+            )
+            self.start_auto_force()
+            return
+        if mode == "sequence":
+            self.sequence_targets = self._build_sequence_targets()
+            if not self.sequence_targets:
+                QMessageBox.warning(self, "序列标定", "当前参数没有生成任何标定点")
+                return
+            self.sequence_index = 0
+            self.start_next_sequence_target()
+            return
+        if mode == "combined":
+            self.start_training_collection()
+
+    def _training_devices_ready(self) -> bool:
+        if not self.esp32:
+            QMessageBox.warning(self, "训练数据采集", "请先连接 ESP32 电容采集串口")
+            return False
+        if not self.mini45:
+            QMessageBox.warning(self, "训练数据采集", "请先连接 Mini45")
+            return False
+        if not self.motion:
+            QMessageBox.warning(self, "训练数据采集", "请先连接 Arduino 电机控制串口")
+            return False
+        return True
+
+    def _build_sequence_targets(self) -> list[CalibrationTarget]:
+        axis = self._combo_value(self.load_axis)
+        if axis == "Fz":
+            return generate_fz_sequence(self.seq_fz_max.value(), self.seq_fz_step.value(), self.seq_cycles.value())
+        return generate_shear_sequence(
+            axis=axis,
+            max_force=self.seq_shear_max.value(),
+            step=self.seq_shear_step.value(),
+            target_fz=self.target_fz.value(),
+            direction_mode=self._combo_value(self.seq_shear_direction),
+            cycles=self.seq_cycles.value(),
+        )
+
+    def start_next_sequence_target(self) -> None:
+        if self.sequence_index >= len(self.sequence_targets):
+            self.stop_calibration("序列标定完成")
+            return
+        self.active_target = self.sequence_targets[self.sequence_index]
+        self._apply_target_to_ui(self.active_target)
+        self.cal_status.setText(f"标定状态：序列点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
+        self.start_auto_force()
+
+    def _apply_target_to_ui(self, target: CalibrationTarget) -> None:
+        self._set_combo_by_data(self.load_axis, target.axis)
+        self._set_combo_by_data(self.branch, target.branch)
+        self._set_combo_by_data(self.direction, target.direction)
+        self.target_fx.setValue(target.target_fx)
+        self.target_fy.setValue(target.target_fy)
+        self.target_fz.setValue(target.target_fz)
+
+    def start_training_collection(self) -> None:
+        try:
+            fz_levels = parse_force_levels(self.training_fz_levels.text())
+            self.training_segments = generate_training_trajectory(
+                fz_levels=fz_levels,
+                shear_max=self.training_shear_max.value(),
+                trajectory_type=self._combo_value(self.training_trajectory_type),
+                force_rate_n_s=self.training_force_rate.value(),
+                hold_s=self.training_hold_s.value(),
+                recovery_s=self.training_recovery_s.value(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "训练数据采集", str(exc))
+            return
+        if not self.training_segments:
+            QMessageBox.warning(self, "训练数据采集", "当前参数没有生成训练轨迹")
+            return
+
+        self.training_count += 1
+        self.current_cycle_id = f"training_{self.training_count:03d}"
+        self.training_active = True
+        self.training_segment_index = 0
+        self.training_current_segment = None
+        if self.recorder:
+            self.recorder.start_training_files()
+        self._write_training_marker("training_start")
+        self._enter_training_segment(0)
+        self.start_auto_force()
+        if not self.auto_force_active:
+            self.finish_training_collection("启动失败")
+            return
+        self._log("训练数据采集开始：仅写入 training_raw_timeseries.csv 和 training_markers.csv")
+
+    def _enter_training_segment(self, index: int) -> None:
+        self.training_segment_index = index
+        self.training_current_segment = self.training_segments[index]
+        self.training_segment_start_s = time.monotonic()
+        self._set_training_target(self.training_current_segment.target_at(0.0))
+        self._write_training_marker(self._training_marker_note(self.training_current_segment))
+
+    def _set_training_target(self, target) -> None:
+        self.active_target = CalibrationTarget(
+            axis="combined",
+            direction=self.training_current_segment.direction if self.training_current_segment else "none",
+            branch=self.training_current_segment.branch if self.training_current_segment else "loading",
+            target_fx=target.target_fx,
+            target_fy=target.target_fy,
+            target_fz=target.target_fz,
+        )
+
+    def _training_marker_note(self, segment: TrainingSegment) -> str:
+        if segment.phase == "preload":
+            return "fz_level_start"
+        if segment.phase == "holding":
+            return "hold_start"
+        if segment.phase == "recovery":
+            return "recovery_start"
+        return "segment_start"
+
+    def _update_training_collection(self) -> None:
+        if not self.training_active or self.calibration_paused:
+            return
+        if not self.training_current_segment:
+            return
+        now = time.monotonic()
+        elapsed = now - self.training_segment_start_s
+        while self.training_current_segment and elapsed >= self.training_current_segment.duration_s:
+            self._set_training_target(self.training_current_segment.target_at(self.training_current_segment.duration_s))
+            self._write_training_marker("segment_end")
+            next_index = self.training_segment_index + 1
+            if next_index >= len(self.training_segments):
+                self.stop_calibration("训练数据采集完成")
+                return
+            self._enter_training_segment(next_index)
+            now = time.monotonic()
+            elapsed = now - self.training_segment_start_s
+
+        if self.training_current_segment:
+            target = self.training_current_segment.target_at(elapsed)
+            self._set_training_target(target)
+            self.cal_status.setText(
+                f"训练采集：{self.training_segment_index + 1}/{len(self.training_segments)}，"
+                f"{self.training_current_segment.phase}，目标 Fx={target.target_fx:.3f}, "
+                f"Fy={target.target_fy:.3f}, Fz={target.target_fz:.3f}"
+            )
+
+    def finish_training_collection(self, reason: str = "停止") -> None:
+        if not self.training_active:
+            return
+        self._write_training_marker("training_end")
+        if self.recorder:
+            self.recorder.stop_training_files()
+        self.training_active = False
+        self.training_segments = []
+        self.training_segment_index = 0
+        self.training_current_segment = None
+        self.training_pause_started_s = 0.0
+        self._log(f"训练数据采集结束：{reason}")
+
+    def _write_training_marker(self, note: str) -> None:
+        if not self.recorder:
+            return
+        self.marker_id += 1
+        meta = self._meta()
+        meta.note = f"{meta.note}; {note}" if meta.note else note
+        segment = self.training_current_segment
+        target = segment.target_at(time.monotonic() - self.training_segment_start_s) if segment else None
+        self.recorder.write_training_marker(
+            self.marker_id,
+            meta,
+            trajectory_type=segment.trajectory_type if segment else self._combo_value(self.training_trajectory_type),
+            phase=segment.phase if segment else note,
+            target_shear_n=target.target_shear_n if target else "",
+            target_angle_deg=target.target_angle_deg if target else "",
+        )
+
+    def pause_calibration(self) -> None:
+        self.calibration_paused = True
+        if self.training_active:
+            self.training_pause_started_s = time.monotonic()
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        self.cal_status.setText("标定状态：已暂停")
+
+    def resume_calibration(self) -> None:
+        if not self.calibration_mode:
+            return
+        if self.training_active and self.training_pause_started_s > 0.0:
+            self.training_segment_start_s += time.monotonic() - self.training_pause_started_s
+            self.training_pause_started_s = 0.0
+        self.calibration_paused = False
+        self.cal_status.setText("标定状态：继续")
+
+    def skip_calibration_point(self) -> None:
+        if self.calibration_mode == "sequence":
+            self.sequence_index += 1
+            self.start_next_sequence_target()
+        else:
+            self.stop_calibration("已跳过当前点")
+
+    def stop_calibration(self, reason: str = "") -> None:
+        if self.training_active:
+            self.finish_training_collection(reason or "停止")
+        if self.zero_drift_active:
+            self.finish_zero_drift(reason or "停止")
+        self.stop_auto_force(reason)
+        self.calibration_mode = ""
+        self.calibration_paused = False
+        self.sequence_targets = []
+        self.sequence_index = 0
+        self.active_target = None
+        self.training_current_segment = None
+        if reason:
+            self.cal_status.setText(f"标定状态：{reason}")
+
+    def start_zero_drift(self) -> None:
+        self.stop_auto_force("零点漂移采集中")
+        self.zero_drift_count += 1
+        self.current_cycle_id = f"zero_{self.zero_drift_count:03d}"
+        self.zero_drift_active = True
+        self.zero_drift_start_s = time.monotonic()
+        self.zero_drift_samples = []
+        path = self.recorder.start_zero_drift_timeseries() if self.recorder else None
+        self.zero_drift_file = path.name if path else ""
+        self._write_marker_with_note("zero_start")
+        self.cal_status.setText(f"标定状态：空载零点漂移采集中，文件 {self.zero_drift_file}")
+        self._log(f"空载零点漂移开始：{self.zero_drift_file}")
+
+    def finish_zero_drift(self, reason: str = "完成") -> None:
+        if not self.zero_drift_active:
+            return
+        self.zero_drift_active = False
+        self._write_marker_with_note("zero_end")
+        if self.recorder:
+            self.recorder.stop_zero_drift_timeseries()
+        self.cal_status.setText(f"标定状态：空载零点漂移{reason}，共 {len(self.zero_drift_samples)} 行")
+        self._log(f"空载零点漂移{reason}：{len(self.zero_drift_samples)} 行")
+
+    def _write_marker_with_note(self, note: str) -> None:
+        self.marker_id += 1
+        meta = self._meta()
+        meta.note = f"{meta.note}; {note}" if meta.note else note
+        if self.recorder:
+            self.recorder.write_marker(self.marker_id, meta)
+
+    def start_auto_force(self) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "自动标定", "请先连接 Arduino 电机控制串口")
+            return
+        if not self.mini45:
+            QMessageBox.warning(self, "自动标定", "请先连接 Mini45 并确认有实时力数据")
+            return
+        self.auto_force_active = True
+        self.auto_force_holding = False
+        self.auto_force_marker_done = False
+        self.auto_force_in_window_since = 0.0
+        self.auto_force_last_move = 0.0
+        self.auto_force_next_move_time = 0.0
+        try:
+            self.motion.set_mode("PC")
+            self.motion.enable(True)
+        except Exception as exc:
+            self.auto_force_active = False
+            QMessageBox.warning(self, "自动标定", str(exc))
+            return
+        meta = self._meta()
+        self.motion_status.setText(f"电机状态：自动逼近 {meta.axis}")
+        self.cal_status.setText(f"标定状态：自动逼近目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}")
+        self._log(f"开始自动标定，目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}，映射 {self.motion_mapping()}")
+
+    def stop_auto_force(self, reason: str = "") -> None:
+        if not self.auto_force_active and not self.auto_force_holding:
+            return
+        self.auto_force_active = False
+        self.auto_force_holding = False
+        self.auto_force_marker_done = False
+        self.auto_force_next_move_time = 0.0
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        if reason:
+            self.motion_status.setText(f"电机状态：自动停止，{reason}")
+            self._log(f"自动逼近停止：{reason}")
+
+    def toggle_recording(self) -> None:
+        if self.recorder:
+            if self.training_active or self.zero_drift_active or self.auto_force_active:
+                self.stop_calibration("实验批次结束")
+            self.recorder.stop()
+            self.recorder = None
+            self.record_btn.setText("开始实验批次")
+            self.record_status.setText("未开始实验批次")
+            self._log("实验批次已结束")
+            return
+        suffix = self._safe_experiment_folder_suffix(self.experiment_id.text().strip())
+        folder_name = time.strftime("%Y%m%d_%H%M%S") + (f"_{suffix}" if suffix else "")
+        output = Path(self.output_dir.text()) / folder_name
+        self.recorder = CsvRecorder(output)
+        self.recorder.start()
+        self.marker_id = 0
+        self.zero_drift_count = 0
+        self.training_count = 0
+        self.current_cycle_id = "cycle_001"
+        self.buffer.clear()
+        self.record_btn.setText("结束实验批次")
+        self.record_status.setText(str(output))
+        self._log(f"实验批次已开始：{output}")
+
+    def _safe_experiment_folder_suffix(self, text: str) -> str:
+        invalid = '<>:"/\\|?*'
+        cleaned = "".join("_" if char in invalid or ord(char) < 32 else char for char in text)
+        cleaned = "_".join(part for part in cleaned.strip(" ._").split() if part)
+        return cleaned[:80]
+
+    def add_marker(self) -> None:
+        self.marker_id += 1
+        meta = self._meta()
+        if self.recorder:
+            self.recorder.write_marker(self.marker_id, meta)
+        end = time.monotonic()
+        samples = self.buffer.window(end, self.stable_window.value())
+        settings = self._stability_settings()
+        result = evaluate_three_axis_stability(samples, meta, settings, SafetySettings())
+        point = build_calibration_point(samples, meta, self.marker_id, result.stable, result.reject_reason)
+        if point and self.recorder:
+            self.recorder.write_calibration_point(point)
+        reason = self._display_reason(result.reject_reason) if result.reject_reason else "通过"
+        self._log(f"标记 {self.marker_id}：有效={self._yes_no(result.stable)}，原因={reason}")
+
+    def _tick(self) -> None:
+        self._drain_esp32()
+        self._drain_mini45()
+        self._drain_motion()
+        if self.zero_drift_active and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
+            self.finish_zero_drift("完成")
+        self._update_training_collection()
+        self._update_auto_force()
+        self._update_status()
+
+    def _drain_esp32(self) -> None:
+        if not self.esp32:
+            return
+        while True:
+            try:
+                item = self.esp32.out_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, Esp32Log):
+                self._log(f"ESP32 {self._display_level(item.level)}：{item.message}")
+            elif isinstance(item, CapSample):
+                self.last_cap_time = item.monotonic_s
+                snapshot = CombinedSnapshot.from_cap(item)
+                self.buffer.append(snapshot)
+                if self.recorder:
+                    if self.training_active:
+                        self.recorder.write_training_raw(snapshot)
+                    else:
+                        self.recorder.write_raw(snapshot)
+                    if self.zero_drift_active:
+                        self.recorder.write_zero_drift_raw(snapshot)
+                if self.zero_drift_active:
+                    self.zero_drift_samples.append(snapshot)
+                self._add_cap_plot(item)
+
+    def _drain_mini45(self) -> None:
+        if not self.mini45:
+            return
+        while True:
+            try:
+                item = self.mini45.out_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, Mini45Log):
+                self._log(f"Mini45 {self._display_level(item.level)}：{item.message}")
+                if item.level in {"warning", "error"}:
+                    self.mini_status.setText(f"Mini45 状态：{self._display_level(item.level)}：{item.message}")
+            elif isinstance(item, ForceSample):
+                first_sample = self.last_force_time <= 0.0
+                self.last_force_time = item.monotonic_s
+                self.latest_force_sample = item
+                if first_sample:
+                    self.mini_status.setText("Mini45 状态：数据正常")
+                    self._log("Mini45 已收到第一帧可解析数据")
+                snapshot = CombinedSnapshot.from_force(item)
+                self.buffer.append(snapshot)
+                if self.recorder:
+                    if self.training_active:
+                        self.recorder.write_training_raw(snapshot)
+                    else:
+                        self.recorder.write_raw(snapshot)
+                    if self.zero_drift_active:
+                        self.recorder.write_zero_drift_raw(snapshot)
+                if self.zero_drift_active:
+                    self.zero_drift_samples.append(snapshot)
+                self._add_force_plot(item)
+
+    def _drain_motion(self) -> None:
+        if not self.motion:
+            return
+        while True:
+            try:
+                item = self.motion.out_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, MotionMessage):
+                if item.kind == "POS":
+                    for axis in ("X", "Y", "Z"):
+                        pos = parse_axis_position(item.values, axis)
+                        if pos is not None:
+                            self.motion_positions[axis] = pos
+                    self._update_motion_status_from_position()
+                elif item.kind in {"STATE", "LIMIT"}:
+                    self._log(f"Arduino {item.kind}: {item.message}")
+                elif item.level in {"warning", "error"}:
+                    self.motion_status.setText(f"电机状态：{self._display_level(item.level)}，{item.message}")
+                    self._log(f"Arduino {self._display_level(item.level)}：{item.message}")
+                elif item.kind == "OK":
+                    self._log(f"Arduino：{item.message or 'OK'}")
+                elif item.kind != "UNKNOWN":
+                    self._log(f"Arduino {item.kind}: {item.message}")
+
+        now = time.monotonic()
+        if now - self.motion_last_query > 1.0:
+            self.motion_last_query = now
+            try:
+                self.motion.query_pos()
+            except Exception:
+                pass
+
+    def _update_motion_status_from_position(self) -> None:
+        parts = []
+        for axis in ("X", "Y", "Z"):
+            value = self.motion_positions.get(axis)
+            parts.append(f"{axis}={value:.4f} mm" if value is not None else f"{axis}=--")
+        prefix = "自动逼近中" if self.auto_force_active else "已连接"
+        self.motion_status.setText(f"电机状态：{prefix}，" + "，".join(parts))
+
+    def _update_auto_force(self) -> None:
+        if not self.auto_force_active:
+            return
+        if not self.motion:
+            self.stop_auto_force("Arduino 未连接")
+            return
+        if self.calibration_paused:
+            return
+        if not self.latest_force_sample or self.last_force_time <= 0.0:
+            return
+
+        now = time.monotonic()
+        if now - self.last_force_time > 1.0:
+            self.stop_auto_force("Mini45 数据超过 1 秒未更新")
+            return
+
+        sample = self.latest_force_sample
+        if abs(sample.fz) > 10.0 or abs(sample.fx) > 4.0 or abs(sample.fy) > 4.0:
+            self.stop_auto_force("力值超过安全限值")
+            return
+
+        meta = self._meta()
+        settings = self._stability_settings()
+        choice = choose_control_axis(sample, meta, settings)
+        force_axis = choice.axis
+        measured = choice.measured
+        target = choice.target
+        tolerance = choice.tolerance
+        error = choice.error
+
+        if choice.all_in_window:
+            if self.training_active:
+                try:
+                    self.motion.stop_all()
+                except Exception:
+                    pass
+                return
+            if not self.auto_force_holding:
+                self.auto_force_holding = True
+                self.auto_force_in_window_since = now
+                try:
+                    self.motion.stop_all()
+                except Exception:
+                    pass
+                self._log("三向力已进入目标窗口，开始稳定计时")
+
+            window_samples = self.buffer.window(now, self.stable_window.value())
+            result = evaluate_three_axis_stability(window_samples, meta, settings, SafetySettings())
+            holding_long_enough = now - self.auto_force_in_window_since >= self.stable_window.value()
+            if holding_long_enough and result.stable and not self.auto_force_marker_done:
+                self.auto_force_marker_done = True
+                self.add_marker()
+                if self.calibration_mode == "sequence":
+                    self.sequence_index += 1
+                    self.stop_auto_force("")
+                    self.start_next_sequence_target()
+                else:
+                    self.stop_calibration("已达到稳定窗口并记录标定点")
+            return
+
+        self.auto_force_holding = False
+        if now < self.auto_force_next_move_time:
+            return
+
+        step_mm = adaptive_force_step_mm(
+            force_error=error,
+            tolerance=tolerance,
+            min_step_mm=self.auto_min_step_mm.value(),
+            max_step_mm=self.auto_step_mm.value(),
+            gain_mm_per_n=self.auto_gain_mm_per_n.value(),
+            min_pulses=AUTO_MIN_PULSES,
+        )
+        if step_mm <= 0.0:
+            return
+
+        motor_axis, delta_mm = mapped_motor_delta(
+            force_axis=force_axis,
+            force_error=error,
+            step_mm=step_mm,
+            mapping=self.motion_mapping(),
+            signs=self.motion_signs(),
+            min_pulses=AUTO_MIN_PULSES,
+        )
+        try:
+            speed_mm_s = self.auto_speed_mm_s.value()
+            self.motion.move_mm(motor_axis, delta_mm, speed_mm_s)
+            self.auto_force_last_move = now
+            move_time = abs(delta_mm) / max(speed_mm_s, 1e-6)
+            self.auto_force_next_move_time = now + max(self.auto_interval_s.value(), move_time + 0.05)
+            self.motion_status.setText(
+                f"电机状态：自动逼近 {force_axis}，目标 {target:.3f}，当前 {measured:.3f}，"
+                f"电机 {motor_axis} {delta_mm:+.4f} mm，{mm_to_pulses(delta_mm):+d} pulse"
+            )
+            self.cal_status.setText(f"标定状态：调节 {force_axis}，目标 {target:.3f}，当前 {measured:.3f}，误差 {error:+.3f}")
+        except Exception as exc:
+            self.stop_auto_force(str(exc))
+
+    def _update_status(self) -> None:
+        samples = self.buffer.window(time.monotonic(), self.stable_window.value())
+        meta = self._meta()
+        result = evaluate_three_axis_stability(samples, meta, self._stability_settings(), SafetySettings())
+        self.window_label.setText(f"目标窗口：{self._yes_no(result.in_window)}")
+        self.stable_label.setText(f"稳定状态：{self._yes_no(result.stable)}")
+        self.safe_label.setText(f"安全状态：{self._yes_no(result.safe)}")
+        self.window_label.setStyleSheet("color: green" if result.in_window else "color: #a66")
+        self.stable_label.setStyleSheet("color: green" if result.stable else "color: #a66")
+        self.safe_label.setStyleSheet("color: green" if result.safe else "color: red")
+        if self.mini45 and self.last_force_time > 0.0 and time.monotonic() - self.last_force_time > 1.0:
+            self.mini_status.setText("Mini45 状态：数据超过 1 秒未更新")
+
+    def _meta(self) -> ExperimentMeta:
+        if self.training_active and self.active_target:
+            return ExperimentMeta(
+                experiment_id=self.experiment_id.text().strip() or "exp001",
+                cycle_id=self.current_cycle_id,
+                branch=self.active_target.branch,
+                axis="combined",
+                direction=self.active_target.direction,
+                preload_n=self.active_target.target_fz,
+                target_fx=self.active_target.target_fx,
+                target_fy=self.active_target.target_fy,
+                target_fz=self.active_target.target_fz,
+                note=self.note.text().strip(),
+            )
+        if self.training_active:
+            return ExperimentMeta(
+                experiment_id=self.experiment_id.text().strip() or "exp001",
+                cycle_id=self.current_cycle_id,
+                branch="training",
+                axis="combined",
+                direction="none",
+                note=self.note.text().strip(),
+            )
+        if self.active_target:
+            return self.active_target.to_meta(
+                ExperimentMeta(
+                    experiment_id=self.experiment_id.text().strip() or "exp001",
+                    cycle_id=self.current_cycle_id,
+                    note=self.note.text().strip(),
+                )
+            )
+        return ExperimentMeta(
+            experiment_id=self.experiment_id.text().strip() or "exp001",
+            cycle_id=self.current_cycle_id,
+            branch=self._combo_value(self.branch),
+            axis=self._combo_value(self.load_axis),
+            direction=self._combo_value(self.direction),
+            preload_n=self.target_fz.value(),
+            target_fx=self.target_fx.value(),
+            target_fy=self.target_fy.value(),
+            target_fz=self.target_fz.value(),
+            note=self.note.text().strip(),
+        )
+
+    def _stability_settings(self) -> StabilitySettings:
+        return StabilitySettings(
+            stable_window_s=self.stable_window.value(),
+            hold_window_s=self.hold_window.value(),
+            tolerance_fx=self.tol_fx.value(),
+            tolerance_fy=self.tol_fy.value(),
+            tolerance_fz=self.tol_fz.value(),
+        )
+
+    def _add_force_plot(self, sample: ForceSample) -> None:
+        x = sample.monotonic_s
+        self.force_x.append(x)
+        for key in self.force_y:
+            self.force_y[key].append(getattr(sample, key))
+        self._trim_plot(self.force_x, self.force_y)
+        for key, curve in self.force_curves.items():
+            curve.setData(self.force_x, self.force_y[key])
+        for label, attr in (("Fx", "fx"), ("Fy", "fy"), ("Fz", "fz"), ("Mx", "mx"), ("My", "my"), ("Mz", "mz")):
+            self.value_labels[label].setText(f"{getattr(sample, attr):.4f}")
+
+    def _add_cap_plot(self, sample: CapSample) -> None:
+        x = sample.monotonic_s
+        self.cap_x.append(x)
+        for key in self.cap_y:
+            self.cap_y[key].append(getattr(sample, key))
+        self._trim_plot(self.cap_x, self.cap_y)
+        for key, curve in self.cap_curves.items():
+            curve.setData(self.cap_x, self.cap_y[key])
+        for label, attr in (("C0", "c0"), ("C1", "c1"), ("C2", "c2"), ("C3", "c3"), ("C4", "c4")):
+            self.value_labels[label].setText(f"{getattr(sample, attr):.6f}")
+
+    def _trim_plot(self, x_values: list[float], y_values: dict[str, list[float]], limit: int = 500) -> None:
+        if len(x_values) <= limit:
+            return
+        del x_values[:-limit]
+        for values in y_values.values():
+            del values[:-limit]
+
+    def _log(self, message: str) -> None:
+        self.log.appendPlainText(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+    def _combo_value(self, combo: QComboBox) -> str:
+        value = combo.currentData()
+        return str(value if value is not None else combo.currentText())
+
+    def _set_combo_by_data(self, combo: QComboBox, value: str) -> None:
+        for index in range(combo.count()):
+            data = combo.itemData(index)
+            if str(data if data is not None else combo.itemText(index)) == value:
+                combo.setCurrentIndex(index)
+                return
+
+    def _yes_no(self, value: bool) -> str:
+        return "是" if value else "否"
+
+    def _display_level(self, level: str) -> str:
+        return {"info": "信息", "warning": "警告", "error": "错误", "debug": "调试"}.get(level, level)
+
+    def _display_reason(self, reason: str) -> str:
+        mapping = {
+            "missing target-axis force samples": "没有目标方向力数据",
+            "target-axis force outside tolerance window": "目标方向力未进入容差窗口",
+            "target-axis force std too high": "目标方向力标准差过大",
+            "force safety limit exceeded": "力值超过安全限值",
+            "torque safety limit exceeded": "力矩超过安全限值",
+        }
+        translated = []
+        for item in reason.split("; "):
+            if item in mapping:
+                translated.append(mapping[item])
+            elif item.endswith(" cross-axis force too high"):
+                translated.append(item.replace(" cross-axis force too high", " 非目标方向力过大"))
+            elif item.endswith(" capacitance jump too high"):
+                translated.append(item.replace(" capacitance jump too high", " 电容跳变过大"))
+            else:
+                translated.append(item)
+        return "；".join(translated)
+
+    def closeEvent(self, event) -> None:
+        if self.esp32:
+            self.esp32.stop()
+        if self.mini45:
+            self.mini45.stop()
+        if self.motion:
+            self.motion.stop()
+        if self.recorder:
+            self.recorder.stop()
+        event.accept()

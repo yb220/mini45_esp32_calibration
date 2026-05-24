@@ -99,6 +99,79 @@ CALIBRATION_FIELDS = [
     "note",
 ]
 
+FORCE_CONTROL_K_FIELDS = [
+    "timestamp",
+    "experiment_id",
+    "valid",
+    "reject_reason",
+    "debug",
+    "delta_X_mm",
+    "delta_Y_mm",
+    "delta_Z_mm",
+    "wait_s",
+    "sample_window_s",
+    "noise_norm",
+    "condition",
+    "singular_1",
+    "singular_2",
+    "singular_3",
+    "K_Fx_X",
+    "K_Fx_Y",
+    "K_Fx_Z",
+    "K_Fy_X",
+    "K_Fy_Y",
+    "K_Fy_Z",
+    "K_Fz_X",
+    "K_Fz_Y",
+    "K_Fz_Z",
+    "before_X_Fx",
+    "before_X_Fy",
+    "before_X_Fz",
+    "after_X_Fx",
+    "after_X_Fy",
+    "after_X_Fz",
+    "before_Y_Fx",
+    "before_Y_Fy",
+    "before_Y_Fz",
+    "after_Y_Fx",
+    "after_Y_Fy",
+    "after_Y_Fz",
+    "before_Z_Fx",
+    "before_Z_Fy",
+    "before_Z_Fz",
+    "after_Z_Fx",
+    "after_Z_Fy",
+    "after_Z_Fz",
+]
+
+FORCE_CONTROL_LOG_FIELDS = [
+    "timestamp",
+    "experiment_id",
+    "cycle_id",
+    "target_Fx",
+    "target_Fy",
+    "target_Fz",
+    "current_Fx",
+    "current_Fy",
+    "current_Fz",
+    "error_Fx",
+    "error_Fy",
+    "error_Fz",
+    "delta_X_mm",
+    "delta_Y_mm",
+    "delta_Z_mm",
+    "pulses_X",
+    "pulses_Y",
+    "pulses_Z",
+    "damping_eta",
+    "trust_scale",
+    "condition",
+    "predicted_dFx",
+    "predicted_dFy",
+    "predicted_dFz",
+    "note",
+]
+
 class CsvRecorder:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -108,12 +181,16 @@ class CsvRecorder:
         self.zero_file = None
         self.training_raw_file = None
         self.training_marker_file = None
+        self.force_control_k_file = None
+        self.force_control_log_file = None
         self.raw_writer: Optional[csv.DictWriter] = None
         self.marker_writer: Optional[csv.DictWriter] = None
         self.cal_writer: Optional[csv.DictWriter] = None
         self.zero_writer: Optional[csv.DictWriter] = None
         self.training_raw_writer: Optional[csv.DictWriter] = None
         self.training_marker_writer: Optional[csv.DictWriter] = None
+        self.force_control_k_writer: Optional[csv.DictWriter] = None
+        self.force_control_log_writer: Optional[csv.DictWriter] = None
         self.zero_drift_index = 0
         self.active_zero_path: Optional[Path] = None
 
@@ -124,25 +201,41 @@ class CsvRecorder:
         self.cal_file = (self.output_dir / "calibration_points.csv").open("w", newline="", encoding="utf-8-sig")
         self.training_raw_file = (self.output_dir / "training_raw_timeseries.csv").open("w", newline="", encoding="utf-8-sig")
         self.training_marker_file = (self.output_dir / "training_markers.csv").open("w", newline="", encoding="utf-8-sig")
+        self.force_control_k_file = (self.output_dir / "force_control_k.csv").open("w", newline="", encoding="utf-8-sig")
+        self.force_control_log_file = (self.output_dir / "force_control_log.csv").open("w", newline="", encoding="utf-8-sig")
         self.raw_writer = csv.DictWriter(self.raw_file, fieldnames=RAW_FIELDS)
         self.marker_writer = csv.DictWriter(self.marker_file, fieldnames=MARKER_FIELDS)
         self.cal_writer = csv.DictWriter(self.cal_file, fieldnames=CALIBRATION_FIELDS)
         self.training_raw_writer = csv.DictWriter(self.training_raw_file, fieldnames=RAW_FIELDS)
         self.training_marker_writer = csv.DictWriter(self.training_marker_file, fieldnames=TRAINING_MARKER_FIELDS)
+        self.force_control_k_writer = csv.DictWriter(self.force_control_k_file, fieldnames=FORCE_CONTROL_K_FIELDS)
+        self.force_control_log_writer = csv.DictWriter(self.force_control_log_file, fieldnames=FORCE_CONTROL_LOG_FIELDS)
         self.raw_writer.writeheader()
         self.marker_writer.writeheader()
         self.cal_writer.writeheader()
         self.training_raw_writer.writeheader()
         self.training_marker_writer.writeheader()
+        self.force_control_k_writer.writeheader()
+        self.force_control_log_writer.writeheader()
 
     def stop(self) -> None:
         self.stop_zero_drift_timeseries()
-        for file_obj in (self.raw_file, self.marker_file, self.cal_file, self.training_raw_file, self.training_marker_file):
+        for file_obj in (
+            self.raw_file,
+            self.marker_file,
+            self.cal_file,
+            self.training_raw_file,
+            self.training_marker_file,
+            self.force_control_k_file,
+            self.force_control_log_file,
+        ):
             if file_obj:
                 file_obj.flush()
                 file_obj.close()
         self.raw_file = self.marker_file = self.cal_file = self.training_raw_file = self.training_marker_file = None
+        self.force_control_k_file = self.force_control_log_file = None
         self.raw_writer = self.marker_writer = self.cal_writer = self.training_raw_writer = self.training_marker_writer = None
+        self.force_control_k_writer = self.force_control_log_writer = None
 
     def write_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.raw_writer:
@@ -271,6 +364,24 @@ class CsvRecorder:
         for file_obj in (self.training_raw_file, self.training_marker_file):
             if file_obj:
                 file_obj.flush()
+
+    def write_force_control_k(self, row: dict) -> None:
+        if not self.force_control_k_writer:
+            return
+        out = {field: row.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
+        out["timestamp"] = out["timestamp"] or utc_timestamp()
+        self.force_control_k_writer.writerow(out)
+        if self.force_control_k_file:
+            self.force_control_k_file.flush()
+
+    def write_force_control_log(self, row: dict) -> None:
+        if not self.force_control_log_writer:
+            return
+        out = {field: row.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
+        out["timestamp"] = out["timestamp"] or utc_timestamp()
+        self.force_control_log_writer.writerow(out)
+        if self.force_control_log_file:
+            self.force_control_log_file.flush()
 
     def __enter__(self) -> "CsvRecorder":
         self.start()

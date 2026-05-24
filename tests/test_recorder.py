@@ -6,6 +6,8 @@ from pathlib import Path
 from app.models import CalibrationPoint, CombinedSnapshot, ExperimentMeta
 from app.recorder import (
     CALIBRATION_FIELDS,
+    FORCE_CONTROL_K_FIELDS,
+    FORCE_CONTROL_LOG_FIELDS,
     MARKER_FIELDS,
     RAW_FIELDS,
     TRAINING_MARKER_FIELDS,
@@ -72,6 +74,10 @@ class RecorderTests(unittest.TestCase):
                 self.assertEqual(next(csv.reader(f)), RAW_FIELDS)
             with (out / "training_markers.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), TRAINING_MARKER_FIELDS)
+            with (out / "force_control_k.csv").open(encoding="utf-8-sig") as f:
+                self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_K_FIELDS)
+            with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
+                self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_LOG_FIELDS)
 
     def test_zero_drift_timeseries_uses_raw_schema_and_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +120,23 @@ class RecorderTests(unittest.TestCase):
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], TRAINING_MARKER_FIELDS)
             self.assertEqual(len(rows), 2)
+
+    def test_force_control_files_are_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            recorder = CsvRecorder(out)
+            recorder.start()
+            recorder.write_force_control_k({"experiment_id": "e1", "valid": True, "K_Fx_X": 1.0})
+            recorder.write_force_control_log({"experiment_id": "e1", "cycle_id": "c1", "delta_X_mm": 0.005})
+            recorder.stop()
+
+            with (out / "force_control_k.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["experiment_id"], "e1")
+            self.assertEqual(rows[0]["K_Fx_X"], "1.0")
+            with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["cycle_id"], "c1")
 
 
 if __name__ == "__main__":

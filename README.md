@@ -13,6 +13,7 @@ mini45_esp32_calibration/
     gui.py                  # 主界面和实验流程
     recorder.py             # CSV 批次文件写入
     calibration.py          # 标定序列和训练轨迹生成
+    force_control.py        # K 矩阵辨识与解耦力控算法
     stability.py            # 稳定判定和标定点生成
     esp32_serial.py         # ESP32 串口采集
     mini45_netft.py         # Mini45 NETBA / simulator
@@ -51,11 +52,12 @@ python -m app.main
 2. 填写实验批次/安装编号，例如 sensor01_mount01。
 3. 点击“开始实验批次”。
 4. 选择“空载零点漂移”，点击“开始标定”。
-5. 选择“序列标定”，加载轴选 Fz，点击“开始标定”。
-6. 选择“序列标定”，加载轴选 Fx，点击“开始标定”。
-7. 选择“序列标定”，加载轴选 Fy，点击“开始标定”。
-8. 选择“训练数据采集 / 连续组合加载”，按需要运行不同轨迹。
-9. 全部完成后点击“结束实验批次”。
+5. 点击“自动辨识 K”，完成三轴力-位移灵敏度矩阵辨识。
+6. 选择“序列标定”，加载轴选 Fz，点击“开始标定”。
+7. 选择“序列标定”，加载轴选 Fx，点击“开始标定”。
+8. 选择“序列标定”，加载轴选 Fy，点击“开始标定”。
+9. 选择“训练数据采集 / 连续组合加载”，按需要运行不同轨迹。
+10. 全部完成后点击“结束实验批次”。
 ```
 
 注意：
@@ -81,7 +83,9 @@ python -m app.main
 
 ### 单目标点标定
 
-输入 `target_Fx,target_Fy,target_Fz`，上位机根据 Mini45 反馈闭环控制电机逼近目标。三向力进入容差窗口并满足稳定判据后，自动写入 marker 和稳定标定点。
+输入 `target_Fx,target_Fy,target_Fz`，上位机根据 Mini45 反馈和自动辨识得到的 `K` 矩阵闭环控制三轴电机逼近目标。三向力进入容差窗口并满足稳定判据后，自动写入 marker 和稳定标定点。
+
+正式自动力控前需要先点击 `自动辨识 K`。若未完成有效 K 辨识，上位机会拒绝启动自动标定；`使用调试 K` 仅用于无硬件流程检查。
 
 ### 序列标定
 
@@ -120,6 +124,8 @@ runs/
     zero_drift_timeseries_001.csv
     training_raw_timeseries.csv
     training_markers.csv
+    force_control_k.csv
+    force_control_log.csv
 ```
 
 ### raw_timeseries.csv
@@ -185,6 +191,14 @@ target_Fx,target_Fy,target_Fz,
 target_shear_N,target_angle_deg,note
 ```
 
+### force_control_k.csv
+
+记录每次自动 `K` 矩阵辨识结果，包括扰动位移、扰动前后 Mini45 三向力均值、`K` 九个元素、奇异值、条件数、有效性和失败原因。
+
+### force_control_log.csv
+
+记录自动力控每一步的目标力、当前力、三向误差、`ΔX/ΔY/ΔZ`、脉冲量、自动阻尼、信任域比例和预测力变化。该文件用于复现实验控制过程和排查自动加载问题。
+
 ## 硬件连接
 
 电脑需要同时连接：
@@ -193,7 +207,7 @@ target_shear_N,target_angle_deg,note
 - 网线连接 Mini45 NETBA：采集六轴力/力矩
 - USB 连接 Arduino Mega：控制三轴电机
 
-默认力轴到电机轴映射：
+手动小步调试区域保留力轴到电机轴映射，默认关系：
 
 ```text
 Mini45 Fx -> Z 电机
@@ -202,6 +216,8 @@ Mini45 Fz -> X 电机
 ```
 
 如果点击力轴正向小步后 Mini45 对应力反向变化，只需要在上位机中修改该力轴符号，不需要重新接线。
+
+正式自动力控不使用上述单轴映射，而使用自动辨识得到的完整 `3×3` 灵敏度矩阵。矩阵列固定对应 Arduino `X/Y/Z` 电机轴，行固定对应 Mini45 `Fx/Fy/Fz`。
 
 ## ESP32 串口协议
 
@@ -267,6 +283,8 @@ Fz = 0.5 N
 剪切最大力 = 0.3 N
 ```
 
+自动力控仍使用 Arduino 固件已有的 `MOVE_MM` 指令，不需要修改 Arduino 串口协议。
+
 ## 后续数据分析建议
 
 上位机输出的是原始数据和 marker。后续项目应基于这些文件完成：
@@ -285,6 +303,9 @@ Fz = 0.5 N
 - `calibration_points.csv`：论文静态指标、传统标定模型
 - `zero_drift_timeseries_XXX.csv`：零点漂移分析
 - `training_raw_timeseries.csv + training_markers.csv`：深度学习实时力预测模型训练
+- `force_control_k.csv + force_control_log.csv`：自动力控过程复核和论文方法说明
+
+更具体的标定控制算法和实验技术细节见 `CALIBRATION_TECHNICAL_DETAILS.md`。
 
 ## 测试
 

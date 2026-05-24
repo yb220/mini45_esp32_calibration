@@ -34,7 +34,6 @@ from .buffers import SampleBuffer
 from .calibration import (
     CalibrationTarget,
     TrainingSegment,
-    choose_control_axis,
     generate_training_trajectory,
     generate_fz_sequence,
     generate_shear_sequence,
@@ -42,12 +41,9 @@ from .calibration import (
 )
 from .arduino_motion import (
     ArduinoMotionAdapter,
-    AUTO_DEFAULT_GAIN_MM_PER_N,
     AUTO_DEFAULT_INTERVAL_S,
     AUTO_DEFAULT_MAX_STEP_MM,
-    AUTO_DEFAULT_MIN_STEP_MM,
     AUTO_DEFAULT_SPEED_MM_S,
-    AUTO_MIN_PULSES,
     DEFAULT_FORCE_TO_MOTOR,
     DEFAULT_FORCE_TO_MOTOR_SIGN,
     MANUAL_DEFAULT_SPEED_MM_S,
@@ -57,12 +53,21 @@ from .arduino_motion import (
     PULSES_PER_MM,
     PULSES_PER_REV,
     SCREW_LEAD_MM,
-    adaptive_force_step_mm,
     mapped_motor_delta,
     mm_to_pulses,
     parse_axis_position,
 )
 from .esp32_serial import Esp32Log, Esp32SerialAdapter
+from .force_control import (
+    MOTOR_AXES,
+    DecoupledControlSettings,
+    DecoupledControlState,
+    compute_decoupled_command,
+    debug_identity_k,
+    force_stats,
+    force_vector_from_sample,
+    identify_k_matrix,
+)
 from .mini45_netft import Mini45Log, Mini45NetFTAdapter, Mini45Simulator, fetch_netft_config
 from .models import (
     CapSample,
@@ -117,6 +122,17 @@ class MainWindow(QMainWindow):
         self.training_segment_start_s = 0.0
         self.training_current_segment: TrainingSegment | None = None
         self.training_pause_started_s = 0.0
+        self.force_control_result = None
+        self.force_control_state = DecoupledControlState()
+        self.k_ident_active = False
+        self.k_ident_axis_index = 0
+        self.k_ident_phase = ""
+        self.k_ident_phase_start_s = 0.0
+        self.k_ident_wait_until_s = 0.0
+        self.k_ident_before_means: dict[str, list[float]] = {}
+        self.k_ident_after_means: dict[str, list[float]] = {}
+        self.k_ident_before_stds: dict[str, list[float]] = {}
+        self.k_ident_after_stds: dict[str, list[float]] = {}
 
         self.force_x: list[float] = []
         self.force_y = {key: [] for key in ("fx", "fy", "fz")}
@@ -438,29 +454,70 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.seq_shear_direction, 1, 3)
         layout.addWidget(self.sequence_group)
 
-        self.closed_loop_group = QGroupBox("电机闭环参数")
+        self.closed_loop_group = QGroupBox("力控矩阵辨识 / 解耦控制")
         grid = QGridLayout(self.closed_loop_group)
         self.auto_interval_s = self._spin(0.05, 5.0, AUTO_DEFAULT_INTERVAL_S)
         self.auto_interval_s.setSingleStep(0.05)
-        self.auto_min_step_mm = self._spin(MM_PER_PULSE, 1.0, AUTO_DEFAULT_MIN_STEP_MM)
-        self.auto_min_step_mm.setSingleStep(MM_PER_PULSE)
         self.auto_step_mm = self._spin(MM_PER_PULSE, 2.0, AUTO_DEFAULT_MAX_STEP_MM)
         self.auto_step_mm.setSingleStep(MM_PER_PULSE)
-        self.auto_gain_mm_per_n = self._spin(0.001, 1.0, AUTO_DEFAULT_GAIN_MM_PER_N)
-        self.auto_gain_mm_per_n.setSingleStep(0.005)
         self.auto_speed_mm_s = self._spin(0.001, 20.0, AUTO_DEFAULT_SPEED_MM_S)
         self.auto_speed_mm_s.setSingleStep(0.1)
-        grid.addWidget(QLabel("控制间隔 s"), 0, 0)
-        grid.addWidget(self.auto_interval_s, 0, 1)
-        grid.addWidget(QLabel("最小/最大步 mm"), 0, 2)
-        row = QHBoxLayout()
-        row.addWidget(self.auto_min_step_mm)
-        row.addWidget(self.auto_step_mm)
-        grid.addLayout(row, 0, 3)
-        grid.addWidget(QLabel("比例 mm/N"), 1, 0)
-        grid.addWidget(self.auto_gain_mm_per_n, 1, 1)
-        grid.addWidget(QLabel("速度 mm/s"), 1, 2)
-        grid.addWidget(self.auto_speed_mm_s, 1, 3)
+        self.k_delta_x = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        self.k_delta_y = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        for spin in (self.k_delta_x, self.k_delta_y, self.k_delta_z):
+            spin.setSingleStep(MM_PER_PULSE)
+        self.k_wait_s = self._spin(0.1, 5.0, 0.5)
+        self.k_sample_s = self._spin(0.1, 5.0, 0.5)
+        self.k_condition_limit = self._spin(10.0, 1000.0, 300.0)
+        self.control_style = QComboBox()
+        self.control_style.addItem("保守", "conservative")
+        self.control_style.addItem("标准", "standard")
+        self.control_style.addItem("快速", "fast")
+
+        grid.addWidget(QLabel("δX/δY/δZ mm"), 0, 0)
+        delta_row = QHBoxLayout()
+        delta_row.addWidget(self.k_delta_x)
+        delta_row.addWidget(self.k_delta_y)
+        delta_row.addWidget(self.k_delta_z)
+        grid.addLayout(delta_row, 0, 1, 1, 3)
+        grid.addWidget(QLabel("等待/采样 s"), 1, 0)
+        wait_row = QHBoxLayout()
+        wait_row.addWidget(self.k_wait_s)
+        wait_row.addWidget(self.k_sample_s)
+        grid.addLayout(wait_row, 1, 1)
+        grid.addWidget(QLabel("条件数上限"), 1, 2)
+        grid.addWidget(self.k_condition_limit, 1, 3)
+        grid.addWidget(QLabel("最大单步 mm"), 2, 0)
+        grid.addWidget(self.auto_step_mm, 2, 1)
+        grid.addWidget(QLabel("控制间隔 s"), 2, 2)
+        grid.addWidget(self.auto_interval_s, 2, 3)
+        grid.addWidget(QLabel("速度 mm/s"), 3, 0)
+        grid.addWidget(self.auto_speed_mm_s, 3, 1)
+        grid.addWidget(QLabel("控制风格"), 3, 2)
+        grid.addWidget(self.control_style, 3, 3)
+
+        k_buttons = QHBoxLayout()
+        self.k_ident_btn = QPushButton("自动辨识 K")
+        self.k_ident_btn.clicked.connect(self.start_k_identification)
+        self.k_clear_btn = QPushButton("清除 K")
+        self.k_clear_btn.clicked.connect(self.clear_force_control_k)
+        self.k_debug_btn = QPushButton("使用调试 K")
+        self.k_debug_btn.clicked.connect(self.use_debug_k)
+        k_buttons.addWidget(self.k_ident_btn)
+        k_buttons.addWidget(self.k_clear_btn)
+        k_buttons.addWidget(self.k_debug_btn)
+        grid.addLayout(k_buttons, 4, 0, 1, 4)
+
+        self.k_status = QLabel("K 状态：未辨识")
+        grid.addWidget(self.k_status, 5, 0, 1, 4)
+        self.k_value_labels = {}
+        for row, force_axis in enumerate(("Fx", "Fy", "Fz")):
+            grid.addWidget(QLabel(force_axis), 6 + row, 0)
+            for col, motor_axis in enumerate(("X", "Y", "Z")):
+                label = QLabel("0.0000")
+                self.k_value_labels[(force_axis, motor_axis)] = label
+                grid.addWidget(label, 6 + row, 1 + col)
         layout.addWidget(self.closed_loop_group)
 
         self.combined_group = QGroupBox("训练数据采集 / 连续组合加载")
@@ -712,6 +769,7 @@ class MainWindow(QMainWindow):
     def toggle_motion(self) -> None:
         if self.motion:
             self.stop_auto_force("Arduino 已断开")
+            self.abort_k_identification("Arduino 已断开")
             self.motion.stop()
             self.motion = None
             self.motion_btn.setText("连接 Arduino")
@@ -756,6 +814,7 @@ class MainWindow(QMainWindow):
 
     def motion_stop(self) -> None:
         self.stop_auto_force("急停")
+        self.abort_k_identification("急停")
         if not self.motion:
             return
         try:
@@ -770,6 +829,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.stop_auto_force("回零")
+            self.abort_k_identification("回零")
             self.motion.home(axis)
             self._log(f"Arduino 回零命令已发送：{axis}")
         except Exception as exc:
@@ -812,6 +872,233 @@ class MainWindow(QMainWindow):
             "Fy": int(self.sign_fy.currentData()),
             "Fz": int(self.sign_fz.currentData()),
         }
+
+    def k_delta_values(self) -> dict[str, float]:
+        return {
+            "X": self.k_delta_x.value(),
+            "Y": self.k_delta_y.value(),
+            "Z": self.k_delta_z.value(),
+        }
+
+    def start_k_identification(self) -> None:
+        if not self.motion:
+            QMessageBox.warning(self, "K 辨识", "请先连接 Arduino 电机控制串口")
+            return
+        if not self.mini45:
+            QMessageBox.warning(self, "K 辨识", "请先连接 Mini45 并确认有实时力数据")
+            return
+        if not self.latest_force_sample or time.monotonic() - self.last_force_time > 1.0:
+            QMessageBox.warning(self, "K 辨识", "Mini45 暂无实时力数据")
+            return
+        self.stop_auto_force("开始 K 辨识")
+        self.k_ident_active = True
+        self.k_ident_axis_index = 0
+        self.k_ident_phase = "before"
+        self.k_ident_phase_start_s = time.monotonic()
+        self.k_ident_wait_until_s = 0.0
+        self.k_ident_before_means = {}
+        self.k_ident_after_means = {}
+        self.k_ident_before_stds = {}
+        self.k_ident_after_stds = {}
+        self.force_control_result = None
+        self.force_control_state = DecoupledControlState()
+        try:
+            self.motion.set_mode("PC")
+            self.motion.enable(True)
+        except Exception as exc:
+            self.abort_k_identification(str(exc))
+            return
+        self.k_status.setText("K 状态：正在辨识 X 轴扰动前均值")
+        self.cal_status.setText("标定状态：K 自动辨识中")
+        self._log("开始自动辨识 K：列顺序固定为 Arduino X/Y/Z，行顺序为 Mini45 Fx/Fy/Fz")
+
+    def clear_force_control_k(self) -> None:
+        self.force_control_result = None
+        self.force_control_state = DecoupledControlState()
+        self.k_status.setText("K 状态：未辨识")
+        for label in self.k_value_labels.values():
+            label.setText("0.0000")
+        self._log("已清除当前 K")
+
+    def use_debug_k(self) -> None:
+        self.force_control_result = debug_identity_k()
+        self.force_control_state = DecoupledControlState()
+        self.update_k_display()
+        self.write_k_identification_result()
+        QMessageBox.warning(self, "调试 K", "已启用单位调试矩阵，仅用于无硬件流程检查，不建议用于正式标定")
+
+    def abort_k_identification(self, reason: str) -> None:
+        if not self.k_ident_active:
+            return
+        self.k_ident_active = False
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        self.k_status.setText(f"K 状态：辨识失败，{reason}")
+        self.cal_status.setText(f"标定状态：K 辨识失败，{reason}")
+        self._log(f"K 辨识失败：{reason}")
+
+    def _force_sample_window(self, seconds: float):
+        return force_stats(self.buffer.window(time.monotonic(), seconds))
+
+    def _current_force_safe(self) -> bool:
+        if not self.latest_force_sample:
+            return False
+        sample = self.latest_force_sample
+        safety = SafetySettings()
+        torque_limit = self._stability_settings().torque_abs_max
+        return (
+            abs(sample.fx) <= safety.fx_abs_max_n
+            and abs(sample.fy) <= safety.fy_abs_max_n
+            and abs(sample.fz) <= safety.fz_abs_max_n
+            and abs(sample.mx) <= torque_limit
+            and abs(sample.my) <= torque_limit
+            and abs(sample.mz) <= torque_limit
+        )
+
+    def _update_k_identification(self) -> None:
+        if not self.k_ident_active:
+            return
+        if not self.motion:
+            self.abort_k_identification("Arduino 未连接")
+            return
+        if not self.latest_force_sample or time.monotonic() - self.last_force_time > 1.0:
+            self.abort_k_identification("Mini45 数据超过 1 秒未更新")
+            return
+        if not self._current_force_safe():
+            self.abort_k_identification("力值超过安全限值")
+            return
+
+        now = time.monotonic()
+        axis = MOTOR_AXES[self.k_ident_axis_index]
+        sample_window = self.k_sample_s.value()
+        if self.k_ident_phase == "before":
+            if now - self.k_ident_phase_start_s < sample_window:
+                return
+            stats = self._force_sample_window(sample_window)
+            if stats.count < 2:
+                self.abort_k_identification("扰动前 Mini45 数据不足")
+                return
+            self.k_ident_before_means[axis] = stats.mean
+            self.k_ident_before_stds[axis] = stats.std
+            delta = self.k_delta_values()[axis]
+            try:
+                self.motion.move_mm(axis, delta, self.auto_speed_mm_s.value())
+            except Exception as exc:
+                self.abort_k_identification(str(exc))
+                return
+            move_time = abs(delta) / max(self.auto_speed_mm_s.value(), 1e-6)
+            self.k_ident_phase = "after_wait"
+            self.k_ident_wait_until_s = now + move_time + self.k_wait_s.value() + 0.05
+            self.k_status.setText(f"K 状态：{axis} 轴扰动 {delta:+.4f} mm，等待稳定")
+            return
+
+        if self.k_ident_phase == "after_wait":
+            if now < self.k_ident_wait_until_s:
+                return
+            self.k_ident_phase = "after"
+            self.k_ident_phase_start_s = now
+            self.k_status.setText(f"K 状态：正在采集 {axis} 轴扰动后均值")
+            return
+
+        if self.k_ident_phase == "after":
+            if now - self.k_ident_phase_start_s < sample_window:
+                return
+            stats = self._force_sample_window(sample_window)
+            if stats.count < 2:
+                self.abort_k_identification("扰动后 Mini45 数据不足")
+                return
+            self.k_ident_after_means[axis] = stats.mean
+            self.k_ident_after_stds[axis] = stats.std
+            delta = -self.k_delta_values()[axis]
+            try:
+                self.motion.move_mm(axis, delta, self.auto_speed_mm_s.value())
+            except Exception as exc:
+                self.abort_k_identification(str(exc))
+                return
+            move_time = abs(delta) / max(self.auto_speed_mm_s.value(), 1e-6)
+            self.k_ident_phase = "back_wait"
+            self.k_ident_wait_until_s = now + move_time + self.k_wait_s.value() + 0.05
+            self.k_status.setText(f"K 状态：{axis} 轴回退 {delta:+.4f} mm")
+            return
+
+        if self.k_ident_phase == "back_wait":
+            if now < self.k_ident_wait_until_s:
+                return
+            self.k_ident_axis_index += 1
+            if self.k_ident_axis_index >= len(MOTOR_AXES):
+                self.finish_k_identification()
+                return
+            next_axis = MOTOR_AXES[self.k_ident_axis_index]
+            self.k_ident_phase = "before"
+            self.k_ident_phase_start_s = now
+            self.k_status.setText(f"K 状态：正在辨识 {next_axis} 轴扰动前均值")
+
+    def finish_k_identification(self) -> None:
+        self.k_ident_active = False
+        result = identify_k_matrix(
+            before_means=self.k_ident_before_means,
+            after_means=self.k_ident_after_means,
+            before_stds=self.k_ident_before_stds,
+            after_stds=self.k_ident_after_stds,
+            deltas_mm=self.k_delta_values(),
+            condition_limit=self.k_condition_limit.value(),
+        )
+        self.force_control_result = result if result.valid else None
+        self.force_control_state = DecoupledControlState()
+        self.update_k_display(result)
+        self.write_k_identification_result(result)
+        if result.valid:
+            self._log(f"K 辨识完成：条件数 {result.condition:.3f}")
+            self.cal_status.setText("标定状态：K 辨识完成，可开始自动力控")
+        else:
+            self._log(f"K 辨识无效：{result.reject_reason}")
+            QMessageBox.warning(self, "K 辨识", f"K 辨识无效：{result.reject_reason}")
+
+    def update_k_display(self, result=None) -> None:
+        result = result or self.force_control_result
+        if not result:
+            self.k_status.setText("K 状态：未辨识")
+            return
+        status = "有效" if result.valid else "无效"
+        if result.debug:
+            status = "调试矩阵"
+        self.k_status.setText(f"K 状态：{status}，条件数 {result.condition:.3f}，噪声 {result.noise_norm:.4f} N")
+        for row, force_axis in enumerate(("Fx", "Fy", "Fz")):
+            for col, motor_axis in enumerate(("X", "Y", "Z")):
+                self.k_value_labels[(force_axis, motor_axis)].setText(f"{result.k[row][col]:+.4f}")
+
+    def write_k_identification_result(self, result=None) -> None:
+        result = result or self.force_control_result
+        if not result or not self.recorder:
+            return
+        row = {
+            "experiment_id": self.experiment_id.text().strip() or "exp001",
+            "valid": result.valid,
+            "reject_reason": result.reject_reason,
+            "debug": result.debug,
+            "delta_X_mm": result.deltas_mm.get("X", ""),
+            "delta_Y_mm": result.deltas_mm.get("Y", ""),
+            "delta_Z_mm": result.deltas_mm.get("Z", ""),
+            "wait_s": self.k_wait_s.value(),
+            "sample_window_s": self.k_sample_s.value(),
+            "noise_norm": result.noise_norm,
+            "condition": result.condition,
+        }
+        for index in range(3):
+            row[f"singular_{index + 1}"] = result.singular_values[index] if index < len(result.singular_values) else ""
+        for force_index, force_axis in enumerate(("Fx", "Fy", "Fz")):
+            for motor_index, motor_axis in enumerate(("X", "Y", "Z")):
+                row[f"K_{force_axis}_{motor_axis}"] = result.k[force_index][motor_index]
+        for motor_axis in ("X", "Y", "Z"):
+            before = result.before_means.get(motor_axis, [float("nan")] * 3)
+            after = result.after_means.get(motor_axis, [float("nan")] * 3)
+            for force_index, force_axis in enumerate(("Fx", "Fy", "Fz")):
+                row[f"before_{motor_axis}_{force_axis}"] = before[force_index]
+                row[f"after_{motor_axis}_{force_axis}"] = after[force_index]
+        self.recorder.write_force_control_k(row)
 
     def ensure_recording(self) -> bool:
         if self.recorder:
@@ -1094,12 +1381,19 @@ class MainWindow(QMainWindow):
         if not self.mini45:
             QMessageBox.warning(self, "自动标定", "请先连接 Mini45 并确认有实时力数据")
             return
+        if self.k_ident_active:
+            QMessageBox.warning(self, "自动标定", "K 正在自动辨识，请等待辨识结束")
+            return
+        if not self.force_control_result or not self.force_control_result.valid:
+            QMessageBox.warning(self, "自动标定", "请先完成有效的 K 自动辨识，或在调试时手动点击“使用调试 K”")
+            return
         self.auto_force_active = True
         self.auto_force_holding = False
         self.auto_force_marker_done = False
         self.auto_force_in_window_since = 0.0
         self.auto_force_last_move = 0.0
         self.auto_force_next_move_time = 0.0
+        self.force_control_state = DecoupledControlState()
         try:
             self.motion.set_mode("PC")
             self.motion.enable(True)
@@ -1110,7 +1404,7 @@ class MainWindow(QMainWindow):
         meta = self._meta()
         self.motion_status.setText(f"电机状态：自动逼近 {meta.axis}")
         self.cal_status.setText(f"标定状态：自动逼近目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}")
-        self._log(f"开始自动标定，目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}，映射 {self.motion_mapping()}")
+        self._log(f"开始解耦自动力控，目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}")
 
     def stop_auto_force(self, reason: str = "") -> None:
         if not self.auto_force_active and not self.auto_force_holding:
@@ -1148,6 +1442,7 @@ class MainWindow(QMainWindow):
         self.training_count = 0
         self.current_cycle_id = "cycle_001"
         self.buffer.clear()
+        self.clear_force_control_k()
         self.record_btn.setText("结束实验批次")
         self.record_status.setText(str(output))
         self._log(f"实验批次已开始：{output}")
@@ -1177,6 +1472,7 @@ class MainWindow(QMainWindow):
         self._drain_esp32()
         self._drain_mini45()
         self._drain_motion()
+        self._update_k_identification()
         if self.zero_drift_active and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
             self.finish_zero_drift("完成")
         self._update_training_collection()
@@ -1301,17 +1597,19 @@ class MainWindow(QMainWindow):
         if abs(sample.fz) > 10.0 or abs(sample.fx) > 4.0 or abs(sample.fy) > 4.0:
             self.stop_auto_force("力值超过安全限值")
             return
+        if not self.force_control_result or not self.force_control_result.valid:
+            self.stop_auto_force("K 未辨识或无效")
+            return
 
         meta = self._meta()
         settings = self._stability_settings()
-        choice = choose_control_axis(sample, meta, settings)
-        force_axis = choice.axis
-        measured = choice.measured
-        target = choice.target
-        tolerance = choice.tolerance
-        error = choice.error
+        target_force = [meta.target_fx, meta.target_fy, meta.target_fz]
+        current_force = force_vector_from_sample(sample)
+        error = [target_force[index] - current_force[index] for index in range(3)]
+        tolerances = [settings.tolerance_fx, settings.tolerance_fy, settings.tolerance_fz]
+        all_in_window = all(abs(error[index]) <= tolerances[index] for index in range(3))
 
-        if choice.all_in_window:
+        if all_in_window:
             if self.training_active:
                 try:
                     self.motion.stop_all()
@@ -1345,36 +1643,69 @@ class MainWindow(QMainWindow):
         if now < self.auto_force_next_move_time:
             return
 
-        step_mm = adaptive_force_step_mm(
-            force_error=error,
-            tolerance=tolerance,
-            min_step_mm=self.auto_min_step_mm.value(),
-            max_step_mm=self.auto_step_mm.value(),
-            gain_mm_per_n=self.auto_gain_mm_per_n.value(),
-            min_pulses=AUTO_MIN_PULSES,
-        )
-        if step_mm <= 0.0:
-            return
-
-        motor_axis, delta_mm = mapped_motor_delta(
-            force_axis=force_axis,
-            force_error=error,
-            step_mm=step_mm,
-            mapping=self.motion_mapping(),
-            signs=self.motion_signs(),
-            min_pulses=AUTO_MIN_PULSES,
-        )
         try:
             speed_mm_s = self.auto_speed_mm_s.value()
-            self.motion.move_mm(motor_axis, delta_mm, speed_mm_s)
-            self.auto_force_last_move = now
-            move_time = abs(delta_mm) / max(speed_mm_s, 1e-6)
-            self.auto_force_next_move_time = now + max(self.auto_interval_s.value(), move_time + 0.05)
-            self.motion_status.setText(
-                f"电机状态：自动逼近 {force_axis}，目标 {target:.3f}，当前 {measured:.3f}，"
-                f"电机 {motor_axis} {delta_mm:+.4f} mm，{mm_to_pulses(delta_mm):+d} pulse"
+            command = compute_decoupled_command(
+                k=self.force_control_result.k,
+                target_force=target_force,
+                current_force=current_force,
+                state=self.force_control_state,
+                settings=DecoupledControlSettings(
+                    max_step_mm=self.auto_step_mm.value(),
+                    min_pulse=1,
+                    style=self._combo_value(self.control_style),
+                ),
+                safety=SafetySettings(),
+                noise_norm=self.force_control_result.noise_norm,
             )
-            self.cal_status.setText(f"标定状态：调节 {force_axis}，目标 {target:.3f}，当前 {measured:.3f}，误差 {error:+.3f}")
+            sent_axes = []
+            max_move_time = 0.0
+            for motor_axis, delta_mm in command.delta_mm.items():
+                if abs(delta_mm) < 1e-12:
+                    continue
+                self.motion.move_mm(motor_axis, delta_mm, speed_mm_s)
+                sent_axes.append(f"{motor_axis}{delta_mm:+.4f}mm/{command.pulses[motor_axis]:+d}pulse")
+                max_move_time = max(max_move_time, abs(delta_mm) / max(speed_mm_s, 1e-6))
+            if not sent_axes:
+                return
+            self.auto_force_last_move = now
+            self.auto_force_next_move_time = now + max(self.auto_interval_s.value(), max_move_time + 0.05)
+            self.motion_status.setText(
+                f"电机状态：解耦控制，" + "，".join(sent_axes)
+            )
+            self.cal_status.setText(
+                f"标定状态：误差 Fx={error[0]:+.3f}, Fy={error[1]:+.3f}, Fz={error[2]:+.3f}，"
+                f"trust={command.trust_scale:.2f}"
+            )
+            if self.recorder:
+                self.recorder.write_force_control_log(
+                    {
+                        "experiment_id": meta.experiment_id,
+                        "cycle_id": meta.cycle_id,
+                        "target_Fx": meta.target_fx,
+                        "target_Fy": meta.target_fy,
+                        "target_Fz": meta.target_fz,
+                        "current_Fx": current_force[0],
+                        "current_Fy": current_force[1],
+                        "current_Fz": current_force[2],
+                        "error_Fx": error[0],
+                        "error_Fy": error[1],
+                        "error_Fz": error[2],
+                        "delta_X_mm": command.delta_mm["X"],
+                        "delta_Y_mm": command.delta_mm["Y"],
+                        "delta_Z_mm": command.delta_mm["Z"],
+                        "pulses_X": command.pulses["X"],
+                        "pulses_Y": command.pulses["Y"],
+                        "pulses_Z": command.pulses["Z"],
+                        "damping_eta": command.damping_eta,
+                        "trust_scale": command.trust_scale,
+                        "condition": self.force_control_result.condition,
+                        "predicted_dFx": command.predicted_delta_force[0],
+                        "predicted_dFy": command.predicted_delta_force[1],
+                        "predicted_dFz": command.predicted_delta_force[2],
+                        "note": command.note,
+                    }
+                )
         except Exception as exc:
             self.stop_auto_force(str(exc))
 

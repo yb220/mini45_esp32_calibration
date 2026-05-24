@@ -63,7 +63,6 @@ from .force_control import (
     DecoupledControlSettings,
     DecoupledControlState,
     compute_decoupled_command,
-    debug_identity_k,
     force_stats,
     force_vector_from_sample,
     identify_k_matrix,
@@ -359,8 +358,8 @@ class MainWindow(QMainWindow):
         self.experiment_mode = QComboBox()
         self.experiment_mode.addItem("空载零点漂移", "zero")
         self.experiment_mode.addItem("单目标点标定", "single")
-        self.experiment_mode.addItem("序列标定", "sequence")
-        self.experiment_mode.addItem("训练数据采集 / 连续组合加载", "combined")
+        self.experiment_mode.addItem("静态正反程标定", "sequence")
+        self.experiment_mode.addItem("训练数据采集", "combined")
         self.load_axis = QComboBox()
         self.load_axis.addItems(["Fx", "Fy", "Fz"])
         self.load_axis.setCurrentText("Fz")
@@ -420,7 +419,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.hold_window, 3, 3)
         layout.addWidget(self.target_group)
 
-        self.sequence_group = QGroupBox("序列标定参数")
+        self.sequence_group = QGroupBox("静态正反程标定参数")
         grid = QGridLayout(self.sequence_group)
         self.seq_fz_max = self._spin(0.0, 10.0, 9.0)
         self.seq_fz_step = self._spin(0.1, 10.0, 1.0)
@@ -454,7 +453,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.seq_shear_direction, 1, 3)
         layout.addWidget(self.sequence_group)
 
-        self.closed_loop_group = QGroupBox("力控矩阵辨识 / 解耦控制")
+        self.closed_loop_group = QGroupBox("力控参数")
         grid = QGridLayout(self.closed_loop_group)
         self.auto_interval_s = self._spin(0.05, 5.0, AUTO_DEFAULT_INTERVAL_S)
         self.auto_interval_s.setSingleStep(0.05)
@@ -502,25 +501,15 @@ class MainWindow(QMainWindow):
         self.k_ident_btn.clicked.connect(self.start_k_identification)
         self.k_clear_btn = QPushButton("清除 K")
         self.k_clear_btn.clicked.connect(self.clear_force_control_k)
-        self.k_debug_btn = QPushButton("使用调试 K")
-        self.k_debug_btn.clicked.connect(self.use_debug_k)
         k_buttons.addWidget(self.k_ident_btn)
         k_buttons.addWidget(self.k_clear_btn)
-        k_buttons.addWidget(self.k_debug_btn)
         grid.addLayout(k_buttons, 4, 0, 1, 4)
 
         self.k_status = QLabel("K 状态：未辨识")
         grid.addWidget(self.k_status, 5, 0, 1, 4)
-        self.k_value_labels = {}
-        for row, force_axis in enumerate(("Fx", "Fy", "Fz")):
-            grid.addWidget(QLabel(force_axis), 6 + row, 0)
-            for col, motor_axis in enumerate(("X", "Y", "Z")):
-                label = QLabel("0.0000")
-                self.k_value_labels[(force_axis, motor_axis)] = label
-                grid.addWidget(label, 6 + row, 1 + col)
         layout.addWidget(self.closed_loop_group)
 
-        self.combined_group = QGroupBox("训练数据采集 / 连续组合加载")
+        self.combined_group = QGroupBox("训练数据采集")
         form = QFormLayout(self.combined_group)
         self.training_fz_levels = QLineEdit("3,5,7,9")
         self.training_trajectory_type = QComboBox()
@@ -916,16 +905,7 @@ class MainWindow(QMainWindow):
         self.force_control_result = None
         self.force_control_state = DecoupledControlState()
         self.k_status.setText("K 状态：未辨识")
-        for label in self.k_value_labels.values():
-            label.setText("0.0000")
         self._log("已清除当前 K")
-
-    def use_debug_k(self) -> None:
-        self.force_control_result = debug_identity_k()
-        self.force_control_state = DecoupledControlState()
-        self.update_k_display()
-        self.write_k_identification_result()
-        QMessageBox.warning(self, "调试 K", "已启用单位调试矩阵，仅用于无硬件流程检查，不建议用于正式标定")
 
     def abort_k_identification(self, reason: str) -> None:
         if not self.k_ident_active:
@@ -1066,9 +1046,6 @@ class MainWindow(QMainWindow):
         if result.debug:
             status = "调试矩阵"
         self.k_status.setText(f"K 状态：{status}，条件数 {result.condition:.3f}，噪声 {result.noise_norm:.4f} N")
-        for row, force_axis in enumerate(("Fx", "Fy", "Fz")):
-            for col, motor_axis in enumerate(("X", "Y", "Z")):
-                self.k_value_labels[(force_axis, motor_axis)].setText(f"{result.k[row][col]:+.4f}")
 
     def write_k_identification_result(self, result=None) -> None:
         result = result or self.force_control_result
@@ -1136,7 +1113,7 @@ class MainWindow(QMainWindow):
         if mode == "sequence":
             self.sequence_targets = self._build_sequence_targets()
             if not self.sequence_targets:
-                QMessageBox.warning(self, "序列标定", "当前参数没有生成任何标定点")
+                QMessageBox.warning(self, "静态正反程标定", "当前参数没有生成任何标定点")
                 return
             self.sequence_index = 0
             self.start_next_sequence_target()
@@ -1171,11 +1148,11 @@ class MainWindow(QMainWindow):
 
     def start_next_sequence_target(self) -> None:
         if self.sequence_index >= len(self.sequence_targets):
-            self.stop_calibration("序列标定完成")
+            self.stop_calibration("静态正反程标定完成")
             return
         self.active_target = self.sequence_targets[self.sequence_index]
         self._apply_target_to_ui(self.active_target)
-        self.cal_status.setText(f"标定状态：序列点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
+        self.cal_status.setText(f"标定状态：正反程点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
         self.start_auto_force()
 
     def _apply_target_to_ui(self, target: CalibrationTarget) -> None:
@@ -1385,7 +1362,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "自动标定", "K 正在自动辨识，请等待辨识结束")
             return
         if not self.force_control_result or not self.force_control_result.valid:
-            QMessageBox.warning(self, "自动标定", "请先完成有效的 K 自动辨识，或在调试时手动点击“使用调试 K”")
+            QMessageBox.warning(self, "自动标定", "请先完成有效的 K 自动辨识")
             return
         self.auto_force_active = True
         self.auto_force_holding = False

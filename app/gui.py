@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         conn.addWidget(self._build_motion_group(), stretch=1)
         layout.addLayout(conn)
 
+        layout.addWidget(self._build_force_control_group())
         layout.addWidget(self._build_calibration_group())
 
         status_plots = QHBoxLayout()
@@ -347,6 +348,63 @@ class MainWindow(QMainWindow):
         self.refresh_ports()
         return box
 
+    def _build_force_control_group(self) -> QGroupBox:
+        box = QGroupBox("力控参数")
+        grid = QGridLayout(box)
+        self.auto_interval_s = self._spin(0.05, 5.0, AUTO_DEFAULT_INTERVAL_S)
+        self.auto_interval_s.setSingleStep(0.05)
+        self.auto_step_mm = self._spin(MM_PER_PULSE, 2.0, AUTO_DEFAULT_MAX_STEP_MM)
+        self.auto_step_mm.setSingleStep(MM_PER_PULSE)
+        self.auto_speed_mm_s = self._spin(0.001, 20.0, AUTO_DEFAULT_SPEED_MM_S)
+        self.auto_speed_mm_s.setSingleStep(0.1)
+        self.k_delta_x = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        self.k_delta_y = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        for spin in (self.k_delta_x, self.k_delta_y, self.k_delta_z):
+            spin.setSingleStep(MM_PER_PULSE)
+        self.k_wait_s = self._spin(0.1, 5.0, 0.5)
+        self.k_sample_s = self._spin(0.1, 5.0, 0.5)
+        self.k_condition_limit = self._spin(10.0, 1000.0, 300.0)
+        self.control_style = QComboBox()
+        self.control_style.addItem("保守", "conservative")
+        self.control_style.addItem("标准", "standard")
+        self.control_style.addItem("快速", "fast")
+
+        grid.addWidget(QLabel("δX/δY/δZ mm"), 0, 0)
+        delta_row = QHBoxLayout()
+        delta_row.addWidget(self.k_delta_x)
+        delta_row.addWidget(self.k_delta_y)
+        delta_row.addWidget(self.k_delta_z)
+        grid.addLayout(delta_row, 0, 1, 1, 3)
+        grid.addWidget(QLabel("等待/采样 s"), 1, 0)
+        wait_row = QHBoxLayout()
+        wait_row.addWidget(self.k_wait_s)
+        wait_row.addWidget(self.k_sample_s)
+        grid.addLayout(wait_row, 1, 1)
+        grid.addWidget(QLabel("条件数上限"), 1, 2)
+        grid.addWidget(self.k_condition_limit, 1, 3)
+        grid.addWidget(QLabel("最大单步 mm"), 2, 0)
+        grid.addWidget(self.auto_step_mm, 2, 1)
+        grid.addWidget(QLabel("控制间隔 s"), 2, 2)
+        grid.addWidget(self.auto_interval_s, 2, 3)
+        grid.addWidget(QLabel("速度 mm/s"), 3, 0)
+        grid.addWidget(self.auto_speed_mm_s, 3, 1)
+        grid.addWidget(QLabel("控制风格"), 3, 2)
+        grid.addWidget(self.control_style, 3, 3)
+
+        k_buttons = QHBoxLayout()
+        self.k_ident_btn = QPushButton("自动辨识 K")
+        self.k_ident_btn.clicked.connect(self.start_k_identification)
+        self.k_clear_btn = QPushButton("清除 K")
+        self.k_clear_btn.clicked.connect(self.clear_force_control_k)
+        k_buttons.addWidget(self.k_ident_btn)
+        k_buttons.addWidget(self.k_clear_btn)
+        grid.addLayout(k_buttons, 4, 0, 1, 4)
+
+        self.k_status = QLabel("K 状态：未辨识")
+        grid.addWidget(self.k_status, 5, 0, 1, 4)
+        return box
+
     def _build_calibration_group(self) -> QGroupBox:
         box = QGroupBox("标定控制")
         layout = QVBoxLayout(box)
@@ -452,62 +510,6 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.seq_shear_direction_label, 1, 2)
         grid.addWidget(self.seq_shear_direction, 1, 3)
         layout.addWidget(self.sequence_group)
-
-        self.closed_loop_group = QGroupBox("力控参数")
-        grid = QGridLayout(self.closed_loop_group)
-        self.auto_interval_s = self._spin(0.05, 5.0, AUTO_DEFAULT_INTERVAL_S)
-        self.auto_interval_s.setSingleStep(0.05)
-        self.auto_step_mm = self._spin(MM_PER_PULSE, 2.0, AUTO_DEFAULT_MAX_STEP_MM)
-        self.auto_step_mm.setSingleStep(MM_PER_PULSE)
-        self.auto_speed_mm_s = self._spin(0.001, 20.0, AUTO_DEFAULT_SPEED_MM_S)
-        self.auto_speed_mm_s.setSingleStep(0.1)
-        self.k_delta_x = self._spin(MM_PER_PULSE, 0.5, 0.05)
-        self.k_delta_y = self._spin(MM_PER_PULSE, 0.5, 0.05)
-        self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.05)
-        for spin in (self.k_delta_x, self.k_delta_y, self.k_delta_z):
-            spin.setSingleStep(MM_PER_PULSE)
-        self.k_wait_s = self._spin(0.1, 5.0, 0.5)
-        self.k_sample_s = self._spin(0.1, 5.0, 0.5)
-        self.k_condition_limit = self._spin(10.0, 1000.0, 300.0)
-        self.control_style = QComboBox()
-        self.control_style.addItem("保守", "conservative")
-        self.control_style.addItem("标准", "standard")
-        self.control_style.addItem("快速", "fast")
-
-        grid.addWidget(QLabel("δX/δY/δZ mm"), 0, 0)
-        delta_row = QHBoxLayout()
-        delta_row.addWidget(self.k_delta_x)
-        delta_row.addWidget(self.k_delta_y)
-        delta_row.addWidget(self.k_delta_z)
-        grid.addLayout(delta_row, 0, 1, 1, 3)
-        grid.addWidget(QLabel("等待/采样 s"), 1, 0)
-        wait_row = QHBoxLayout()
-        wait_row.addWidget(self.k_wait_s)
-        wait_row.addWidget(self.k_sample_s)
-        grid.addLayout(wait_row, 1, 1)
-        grid.addWidget(QLabel("条件数上限"), 1, 2)
-        grid.addWidget(self.k_condition_limit, 1, 3)
-        grid.addWidget(QLabel("最大单步 mm"), 2, 0)
-        grid.addWidget(self.auto_step_mm, 2, 1)
-        grid.addWidget(QLabel("控制间隔 s"), 2, 2)
-        grid.addWidget(self.auto_interval_s, 2, 3)
-        grid.addWidget(QLabel("速度 mm/s"), 3, 0)
-        grid.addWidget(self.auto_speed_mm_s, 3, 1)
-        grid.addWidget(QLabel("控制风格"), 3, 2)
-        grid.addWidget(self.control_style, 3, 3)
-
-        k_buttons = QHBoxLayout()
-        self.k_ident_btn = QPushButton("自动辨识 K")
-        self.k_ident_btn.clicked.connect(self.start_k_identification)
-        self.k_clear_btn = QPushButton("清除 K")
-        self.k_clear_btn.clicked.connect(self.clear_force_control_k)
-        k_buttons.addWidget(self.k_ident_btn)
-        k_buttons.addWidget(self.k_clear_btn)
-        grid.addLayout(k_buttons, 4, 0, 1, 4)
-
-        self.k_status = QLabel("K 状态：未辨识")
-        grid.addWidget(self.k_status, 5, 0, 1, 4)
-        layout.addWidget(self.closed_loop_group)
 
         self.combined_group = QGroupBox("训练数据采集")
         form = QFormLayout(self.combined_group)
@@ -619,8 +621,6 @@ class MainWindow(QMainWindow):
         is_single = mode == "single"
         is_sequence = mode == "sequence"
         is_combined = mode == "combined"
-        needs_motion = is_single or is_sequence or is_combined
-
         for widget in (self.load_axis_label, self.load_axis):
             widget.setVisible(is_single or is_sequence)
         for widget in (self.branch_label, self.branch, self.direction_label, self.direction):
@@ -629,7 +629,6 @@ class MainWindow(QMainWindow):
         self.zero_group.setVisible(is_zero)
         self.target_group.setVisible(is_single or is_sequence)
         self.sequence_group.setVisible(is_sequence)
-        self.closed_loop_group.setVisible(needs_motion)
         self.combined_group.setVisible(is_combined)
 
         shear_axis = axis in {"Fx", "Fy"}
@@ -637,8 +636,8 @@ class MainWindow(QMainWindow):
             widget.setVisible(is_sequence and axis == "Fz")
         for widget in (self.seq_shear_label, self.seq_shear_max, self.seq_shear_step, self.seq_shear_direction_label, self.seq_shear_direction):
             widget.setVisible(is_sequence and shear_axis)
-        self.cal_pause_btn.setVisible(needs_motion)
-        self.cal_resume_btn.setVisible(needs_motion)
+        self.cal_pause_btn.setVisible(is_single or is_sequence or is_combined)
+        self.cal_resume_btn.setVisible(is_single or is_sequence or is_combined)
         self.cal_skip_btn.setVisible(is_sequence)
 
     def refresh_ports(self) -> None:

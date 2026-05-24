@@ -284,39 +284,12 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.motion_manual_btn)
         form.addRow(btn_row)
 
-        safe_row = QHBoxLayout()
-        self.motion_enable_btn = QPushButton("使能")
-        self.motion_enable_btn.clicked.connect(lambda: self.motion_enable(True))
-        self.motion_disable_btn = QPushButton("失能")
-        self.motion_disable_btn.clicked.connect(lambda: self.motion_enable(False))
-        self.motion_stop_btn = QPushButton("急停")
-        self.motion_stop_btn.clicked.connect(self.motion_stop)
-        safe_row.addWidget(self.motion_enable_btn)
-        safe_row.addWidget(self.motion_disable_btn)
-        safe_row.addWidget(self.motion_stop_btn)
-        form.addRow(safe_row)
-
         home_row = QHBoxLayout()
         for axis in ("X", "Y", "Z", "ALL"):
             btn = QPushButton(f"回零 {axis}")
             btn.clicked.connect(lambda _checked=False, a=axis: self.motion_home(a))
             home_row.addWidget(btn)
         form.addRow(home_row)
-
-        map_grid = QGridLayout()
-        self.map_fx = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fx"])
-        self.map_fy = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fy"])
-        self.map_fz = self._motor_axis_combo(DEFAULT_FORCE_TO_MOTOR["Fz"])
-        self.sign_fx = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fx"])
-        self.sign_fy = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fy"])
-        self.sign_fz = self._sign_combo(DEFAULT_FORCE_TO_MOTOR_SIGN["Fz"])
-        for col, force_axis in enumerate(("Fx", "Fy", "Fz")):
-            map_grid.addWidget(QLabel(force_axis), 0, col)
-        for col, combo in enumerate((self.map_fx, self.map_fy, self.map_fz)):
-            map_grid.addWidget(combo, 1, col)
-        for col, combo in enumerate((self.sign_fx, self.sign_fy, self.sign_fz)):
-            map_grid.addWidget(combo, 2, col)
-        form.addRow("力轴->电机轴/符号", map_grid)
 
         step_row = QHBoxLayout()
         self.motion_force_axis = QComboBox()
@@ -601,19 +574,6 @@ class MainWindow(QMainWindow):
         spin.setSingleStep(0.1)
         return spin
 
-    def _motor_axis_combo(self, current: str) -> QComboBox:
-        combo = QComboBox()
-        combo.addItems(["X", "Y", "Z"])
-        combo.setCurrentText(current)
-        return combo
-
-    def _sign_combo(self, current: int) -> QComboBox:
-        combo = QComboBox()
-        combo.addItem("+", 1)
-        combo.addItem("-", -1)
-        combo.setCurrentIndex(0 if current >= 0 else 1)
-        return combo
-
     def update_calibration_mode_ui(self) -> None:
         mode = self._combo_value(self.experiment_mode)
         axis = self.load_axis.currentText()
@@ -848,18 +808,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Arduino 电机", str(exc))
 
     def motion_mapping(self) -> dict[str, str]:
-        return {
-            "Fx": self.map_fx.currentText(),
-            "Fy": self.map_fy.currentText(),
-            "Fz": self.map_fz.currentText(),
-        }
+        return dict(DEFAULT_FORCE_TO_MOTOR)
 
     def motion_signs(self) -> dict[str, int]:
-        return {
-            "Fx": int(self.sign_fx.currentData()),
-            "Fy": int(self.sign_fy.currentData()),
-            "Fz": int(self.sign_fz.currentData()),
-        }
+        return dict(DEFAULT_FORCE_TO_MOTOR_SIGN)
 
     def k_delta_values(self) -> dict[str, float]:
         return {

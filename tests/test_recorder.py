@@ -8,6 +8,7 @@ from app.recorder import (
     CALIBRATION_FIELDS,
     FORCE_CONTROL_K_FIELDS,
     FORCE_CONTROL_LOG_FIELDS,
+    FORCE_FRAME_MAPPING_FIELDS,
     MARKER_FIELDS,
     RAW_FIELDS,
     TRAINING_MARKER_FIELDS,
@@ -78,6 +79,8 @@ class RecorderTests(unittest.TestCase):
                 self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_K_FIELDS)
             with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_LOG_FIELDS)
+            with (out / "force_frame_mapping.csv").open(encoding="utf-8-sig") as f:
+                self.assertEqual(next(csv.reader(f)), FORCE_FRAME_MAPPING_FIELDS)
 
     def test_zero_drift_timeseries_uses_raw_schema_and_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,6 +131,17 @@ class RecorderTests(unittest.TestCase):
             recorder.start()
             recorder.write_force_control_k({"experiment_id": "e1", "valid": True, "K_Fx_X": 1.0})
             recorder.write_force_control_log({"experiment_id": "e1", "cycle_id": "c1", "delta_X_mm": 0.005})
+            recorder.write_force_frame_mapping(
+                {
+                    "experiment_id": "e1",
+                    "sensor_Fx_from": "Fz",
+                    "sensor_Fx_sign": -1,
+                    "sensor_Fy_from": "Fy",
+                    "sensor_Fy_sign": 1,
+                    "sensor_Fz_from": "Fx",
+                    "sensor_Fz_sign": 1,
+                }
+            )
             recorder.stop()
 
             with (out / "force_control_k.csv").open(encoding="utf-8-sig") as f:
@@ -137,6 +151,10 @@ class RecorderTests(unittest.TestCase):
             with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[0]["cycle_id"], "c1")
+            with (out / "force_frame_mapping.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(rows[0]["sensor_Fx_from"], "Fz")
+            self.assertEqual(rows[0]["sensor_Fx_sign"], "-1")
 
 
 if __name__ == "__main__":

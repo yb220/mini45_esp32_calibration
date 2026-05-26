@@ -58,6 +58,7 @@ from .arduino_motion import (
     parse_axis_position,
 )
 from .esp32_serial import Esp32Log, Esp32SerialAdapter
+from .force_frame import AxisFrameMap, ForceFrameMapping, transform_force_sample
 from .force_control import (
     MOTOR_AXES,
     DecoupledControlSettings,
@@ -132,6 +133,7 @@ class MainWindow(QMainWindow):
         self.k_ident_after_means: dict[str, list[float]] = {}
         self.k_ident_before_stds: dict[str, list[float]] = {}
         self.k_ident_after_stds: dict[str, list[float]] = {}
+        self.force_mapping_error_logged = False
 
         self.force_x: list[float] = []
         self.force_y = {key: [] for key in ("fx", "fy", "fz")}
@@ -154,6 +156,7 @@ class MainWindow(QMainWindow):
         conn.addWidget(self._build_motion_group(), stretch=1)
         layout.addLayout(conn)
 
+        layout.addWidget(self._build_force_frame_group())
         layout.addWidget(self._build_force_control_group())
         layout.addWidget(self._build_calibration_group())
 
@@ -163,7 +166,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(status_plots)
 
         plot_layout = QHBoxLayout()
-        self.force_plot = pg.PlotWidget(title="Mini45 力数据")
+        self.force_plot = pg.PlotWidget(title="传感器坐标力数据")
         self.force_plot.setBackground("w")
         self.force_plot.addLegend()
         self.force_curves = {
@@ -319,6 +322,33 @@ class MainWindow(QMainWindow):
         self.motion_status = QLabel("电机状态：未连接")
         form.addRow(self.motion_status)
         self.refresh_ports()
+        return box
+
+    def _build_force_frame_group(self) -> QGroupBox:
+        box = QGroupBox("传感器坐标映射")
+        grid = QGridLayout(box)
+
+        self.frame_sign_combos: dict[str, QComboBox] = {}
+        self.frame_axis_combos: dict[str, QComboBox] = {}
+        defaults = {"Fx": "Fx", "Fy": "Fy", "Fz": "Fz"}
+        for row, sensor_axis in enumerate(("Fx", "Fy", "Fz")):
+            sign_combo = QComboBox()
+            sign_combo.addItem("+", 1)
+            sign_combo.addItem("-", -1)
+            axis_combo = QComboBox()
+            for mini_axis in ("Fx", "Fy", "Fz"):
+                axis_combo.addItem(f"Mini45 {mini_axis}", mini_axis)
+            self._set_combo_by_data(axis_combo, defaults[sensor_axis])
+            sign_combo.currentIndexChanged.connect(self.on_force_frame_mapping_changed)
+            axis_combo.currentIndexChanged.connect(self.on_force_frame_mapping_changed)
+            self.frame_sign_combos[sensor_axis] = sign_combo
+            self.frame_axis_combos[sensor_axis] = axis_combo
+            grid.addWidget(QLabel(f"传感器 {sensor_axis} ="), row, 0)
+            grid.addWidget(sign_combo, row, 1)
+            grid.addWidget(axis_combo, row, 2)
+
+        self.force_frame_status = QLabel("当前映射：传感器坐标 = Mini45 原始坐标")
+        grid.addWidget(self.force_frame_status, 3, 0, 1, 3)
         return box
 
     def _build_force_control_group(self) -> QGroupBox:
@@ -813,6 +843,52 @@ class MainWindow(QMainWindow):
     def motion_signs(self) -> dict[str, int]:
         return dict(DEFAULT_FORCE_TO_MOTOR_SIGN)
 
+    def current_force_frame_mapping(self) -> ForceFrameMapping:
+        return ForceFrameMapping(
+            sensor_fx=AxisFrameMap(
+                self._combo_value(self.frame_axis_combos["Fx"]),
+                int(self.frame_sign_combos["Fx"].currentData()),
+            ),
+            sensor_fy=AxisFrameMap(
+                self._combo_value(self.frame_axis_combos["Fy"]),
+                int(self.frame_sign_combos["Fy"].currentData()),
+            ),
+            sensor_fz=AxisFrameMap(
+                self._combo_value(self.frame_axis_combos["Fz"]),
+                int(self.frame_sign_combos["Fz"].currentData()),
+            ),
+        )
+
+    def on_force_frame_mapping_changed(self) -> None:
+        if not hasattr(self, "force_frame_status"):
+            return
+        try:
+            mapping = self.current_force_frame_mapping()
+            mapping.validate()
+        except ValueError as exc:
+            self.force_frame_status.setText(f"坐标映射无效：{exc}")
+            self.force_frame_status.setStyleSheet("color: red")
+            return
+        self.force_mapping_error_logged = False
+        self.force_frame_status.setStyleSheet("")
+        self.force_frame_status.setText(
+            "当前映射："
+            f"Fx={mapping.sensor_fx.sign:+d} Mini45 {mapping.sensor_fx.source_axis}，"
+            f"Fy={mapping.sensor_fy.sign:+d} Mini45 {mapping.sensor_fy.source_axis}，"
+            f"Fz={mapping.sensor_fz.sign:+d} Mini45 {mapping.sensor_fz.source_axis}"
+        )
+        if self.force_control_result:
+            self.clear_force_control_k()
+            self._log("坐标映射已修改，当前 K 已清除，需要重新自动辨识")
+
+    def _set_force_frame_mapping_enabled(self, enabled: bool) -> None:
+        for combo in list(self.frame_sign_combos.values()) + list(self.frame_axis_combos.values()):
+            combo.setEnabled(enabled)
+
+    def _update_force_frame_mapping_lock(self) -> None:
+        locked = bool(self.recorder or self.k_ident_active or self.force_control_result)
+        self._set_force_frame_mapping_enabled(not locked)
+
     def k_delta_values(self) -> dict[str, float]:
         return {
             "X": self.k_delta_x.value(),
@@ -826,6 +902,11 @@ class MainWindow(QMainWindow):
             return
         if not self.mini45:
             QMessageBox.warning(self, "K 辨识", "请先连接 Mini45 并确认有实时力数据")
+            return
+        try:
+            self.current_force_frame_mapping().validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "K 辨识", f"请先修正传感器坐标映射：{exc}")
             return
         if not self.latest_force_sample or time.monotonic() - self.last_force_time > 1.0:
             QMessageBox.warning(self, "K 辨识", "Mini45 暂无实时力数据")
@@ -842,6 +923,7 @@ class MainWindow(QMainWindow):
         self.k_ident_after_stds = {}
         self.force_control_result = None
         self.force_control_state = DecoupledControlState()
+        self._update_force_frame_mapping_lock()
         try:
             self.motion.set_mode("PC")
             self.motion.enable(True)
@@ -850,12 +932,13 @@ class MainWindow(QMainWindow):
             return
         self.k_status.setText("K 状态：正在辨识 X 轴扰动前均值")
         self.cal_status.setText("标定状态：K 自动辨识中")
-        self._log("开始自动辨识 K：列顺序固定为 Arduino X/Y/Z，行顺序为 Mini45 Fx/Fy/Fz")
+        self._log("开始自动辨识 K：列顺序固定为 Arduino X/Y/Z，行顺序为传感器坐标 Fx/Fy/Fz")
 
     def clear_force_control_k(self) -> None:
         self.force_control_result = None
         self.force_control_state = DecoupledControlState()
         self.k_status.setText("K 状态：未辨识")
+        self._update_force_frame_mapping_lock()
         self._log("已清除当前 K")
 
     def abort_k_identification(self, reason: str) -> None:
@@ -870,6 +953,7 @@ class MainWindow(QMainWindow):
         self.k_status.setText(f"K 状态：辨识失败，{reason}")
         self.cal_status.setText(f"标定状态：K 辨识失败，{reason}")
         self._log(f"K 辨识失败：{reason}")
+        self._update_force_frame_mapping_lock()
 
     def _force_sample_window(self, seconds: float):
         return force_stats(self.buffer.window(time.monotonic(), seconds))
@@ -981,6 +1065,7 @@ class MainWindow(QMainWindow):
         self.force_control_state = DecoupledControlState()
         self.update_k_display(result)
         self.write_k_identification_result(result)
+        self._update_force_frame_mapping_lock()
         if result.valid:
             self._log(f"K 辨识完成：条件数 {result.condition:.3f}")
             self.cal_status.setText("标定状态：K 辨识完成，可开始自动力控")
@@ -1356,21 +1441,31 @@ class MainWindow(QMainWindow):
                 self.stop_calibration("实验批次结束")
             self.recorder.stop()
             self.recorder = None
+            self.clear_force_control_k()
+            self._update_force_frame_mapping_lock()
             self.record_btn.setText("开始实验批次")
             self.record_status.setText("未开始实验批次")
             self._log("实验批次已结束")
+            return
+        try:
+            mapping = self.current_force_frame_mapping()
+            mapping.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "实验批次", f"请先修正传感器坐标映射：{exc}")
             return
         suffix = self._safe_experiment_folder_suffix(self.experiment_id.text().strip())
         folder_name = time.strftime("%Y%m%d_%H%M%S") + (f"_{suffix}" if suffix else "")
         output = Path(self.output_dir.text()) / folder_name
         self.recorder = CsvRecorder(output)
         self.recorder.start()
+        self.recorder.write_force_frame_mapping(mapping.as_row("", self.experiment_id.text().strip() or "exp001"))
         self.marker_id = 0
         self.zero_drift_count = 0
         self.training_count = 0
         self.current_cycle_id = "cycle_001"
         self.buffer.clear()
         self.clear_force_control_k()
+        self._update_force_frame_mapping_lock()
         self.record_btn.setText("结束实验批次")
         self.record_status.setText(str(output))
         self._log(f"实验批次已开始：{output}")
@@ -1446,12 +1541,21 @@ class MainWindow(QMainWindow):
                     self.mini_status.setText(f"Mini45 状态：{self._display_level(item.level)}：{item.message}")
             elif isinstance(item, ForceSample):
                 first_sample = self.last_force_time <= 0.0
-                self.last_force_time = item.monotonic_s
-                self.latest_force_sample = item
+                try:
+                    mapped_item = transform_force_sample(item, self.current_force_frame_mapping())
+                except ValueError as exc:
+                    if not self.force_mapping_error_logged:
+                        self.force_mapping_error_logged = True
+                        self._log(f"传感器坐标映射无效，Mini45 数据暂不进入标定数据流：{exc}")
+                    self.force_frame_status.setText(f"坐标映射无效：{exc}")
+                    self.force_frame_status.setStyleSheet("color: red")
+                    continue
+                self.last_force_time = mapped_item.monotonic_s
+                self.latest_force_sample = mapped_item
                 if first_sample:
                     self.mini_status.setText("Mini45 状态：数据正常")
                     self._log("Mini45 已收到第一帧可解析数据")
-                snapshot = CombinedSnapshot.from_force(item)
+                snapshot = CombinedSnapshot.from_force(mapped_item, raw_sample=item)
                 self.buffer.append(snapshot)
                 if self.recorder:
                     if self.training_active:
@@ -1462,7 +1566,7 @@ class MainWindow(QMainWindow):
                         self.recorder.write_zero_drift_raw(snapshot)
                 if self.zero_drift_active:
                     self.zero_drift_samples.append(snapshot)
-                self._add_force_plot(item)
+                self._add_force_plot(mapped_item)
 
     def _drain_motion(self) -> None:
         if not self.motion:

@@ -13,6 +13,7 @@ mini45_esp32_calibration/
     gui.py                  # 主界面和实验流程
     recorder.py             # CSV 批次文件写入
     calibration.py          # 标定序列和训练轨迹生成
+    force_frame.py          # Mini45 到传感器坐标映射
     force_control.py        # K 矩阵辨识与解耦力控算法
     stability.py            # 稳定判定和标定点生成
     esp32_serial.py         # ESP32 串口采集
@@ -49,15 +50,16 @@ python -m app.main
 
 ```text
 1. 连接 ESP32、Mini45、Arduino。
-2. 填写实验批次/安装编号，例如 sensor01_mount01。
-3. 点击“开始实验批次”。
-4. 选择“空载零点漂移”，点击“开始标定”。
-5. 点击“自动辨识 K”，完成三轴力-位移灵敏度矩阵辨识。
-6. 选择“静态正反程标定”，加载轴选 Fz，点击“开始标定”。
-7. 选择“静态正反程标定”，加载轴选 Fx，点击“开始标定”。
-8. 选择“静态正反程标定”，加载轴选 Fy，点击“开始标定”。
-9. 选择“训练数据采集”，按需要运行不同轨迹。
-10. 全部完成后点击“结束实验批次”。
+2. 根据安装方向设置“传感器坐标映射”。
+3. 填写实验批次/安装编号，例如 sensor01_mount01。
+4. 点击“开始实验批次”。
+5. 选择“空载零点漂移”，点击“开始标定”。
+6. 点击“自动辨识 K”，完成三轴力-位移灵敏度矩阵辨识。
+7. 选择“静态正反程标定”，加载轴选 Fz，点击“开始标定”。
+8. 选择“静态正反程标定”，加载轴选 Fx，点击“开始标定”。
+9. 选择“静态正反程标定”，加载轴选 Fy，点击“开始标定”。
+10. 选择“训练数据采集”，按需要运行不同轨迹。
+11. 全部完成后点击“结束实验批次”。
 ```
 
 注意：
@@ -67,8 +69,23 @@ python -m app.main
 - 子实验完成后不会关闭批次，可以继续切换模式做下一项。
 - `结束实验批次` 才关闭所有文件。
 - 未开始实验批次时点击 `开始标定`，上位机会提示先开始实验批次。
+- `传感器坐标映射` 应在开始实验批次前设置；批次开始或 K 已辨识后会锁定，避免同一批数据混用不同坐标系。
 - `力控参数` 是实验批次级设置，固定显示在主界面中，不随实验模式切换隐藏或移动。
 - 同一批次内通常只需点击一次 `自动辨识 K`，之后单目标、静态正反程和训练数据采集都会复用当前 K。
+
+## 传感器坐标映射
+
+Mini45 的原始坐标不一定等于待标定传感器坐标。上位机在 Mini45 数据进入主数据流前，先按界面设置把 Mini45 原始力转换为传感器坐标力：
+
+```text
+传感器 Fx = +/- Mini45 Fx/Fy/Fz
+传感器 Fy = +/- Mini45 Fx/Fy/Fz
+传感器 Fz = +/- Mini45 Fx/Fy/Fz
+```
+
+映射必须是一一对应，不能让多个传感器轴同时选择同一个 Mini45 轴。默认映射为 `传感器 Fx=+Mini45 Fx`、`传感器 Fy=+Mini45 Fy`、`传感器 Fz=+Mini45 Fz`。
+
+设置完成后，上位机中的实时曲线、目标力、K 辨识、自动力控、稳定点和训练数据中的 `fx/fy/fz` 都表示传感器坐标。Mini45 原始值会额外保存为 `mini45_raw_*` 字段，便于后续排查。
 
 ## 实验模式
 
@@ -126,6 +143,7 @@ runs/
     zero_drift_timeseries_001.csv
     training_raw_timeseries.csv
     training_markers.csv
+    force_frame_mapping.csv
     force_control_k.csv
     force_control_log.csv
 ```
@@ -139,12 +157,14 @@ runs/
 ```text
 timestamp,monotonic_s,source,
 fx,fy,fz,mx,my,mz,
+mini45_raw_fx,mini45_raw_fy,mini45_raw_fz,
+mini45_raw_mx,mini45_raw_my,mini45_raw_mz,
 c0,c1,c2,c3,c4,
 mini45_sequence,mini45_status,
 esp_ms,esp_sequence
 ```
 
-Mini45 行保存力/力矩，电容为空；ESP32 行保存电容，力/力矩为空。
+Mini45 行保存转换后的传感器坐标力/力矩，同时保存 Mini45 原始力/力矩；ESP32 行保存电容，力/力矩为空。
 
 ### markers.csv
 
@@ -193,9 +213,20 @@ target_Fx,target_Fy,target_Fz,
 target_shear_N,target_angle_deg,note
 ```
 
+### force_frame_mapping.csv
+
+记录本批次使用的 Mini45 到传感器坐标映射。字段包括：
+
+```text
+timestamp,experiment_id,
+sensor_Fx_from,sensor_Fx_sign,
+sensor_Fy_from,sensor_Fy_sign,
+sensor_Fz_from,sensor_Fz_sign
+```
+
 ### force_control_k.csv
 
-记录每次自动 `K` 矩阵辨识结果，包括扰动位移、扰动前后 Mini45 三向力均值、`K` 九个元素、奇异值、条件数、有效性和失败原因。
+记录每次自动 `K` 矩阵辨识结果，包括扰动位移、扰动前后传感器坐标三向力均值、`K` 九个元素、奇异值、条件数、有效性和失败原因。
 
 ### force_control_log.csv
 
@@ -219,7 +250,7 @@ Mini45 Fz -> X 电机
 
 如果点击力轴正向小步后 Mini45 对应力反向变化，应优先检查 Mini45 坐标符号配置和电机方向设置。
 
-正式自动力控不使用上述单轴映射，而使用自动辨识得到的完整 `3×3` 灵敏度矩阵。矩阵列固定对应 Arduino `X/Y/Z` 电机轴，行固定对应 Mini45 `Fx/Fy/Fz`。
+正式自动力控不使用上述单轴映射，而使用自动辨识得到的完整 `3×3` 灵敏度矩阵。矩阵列固定对应 Arduino `X/Y/Z` 电机轴，行固定对应传感器坐标 `Fx/Fy/Fz`。
 
 ## ESP32 串口协议
 

@@ -18,6 +18,12 @@ RAW_FIELDS = [
     "mx",
     "my",
     "mz",
+    "mini45_raw_fx",
+    "mini45_raw_fy",
+    "mini45_raw_fz",
+    "mini45_raw_mx",
+    "mini45_raw_my",
+    "mini45_raw_mz",
     "c0",
     "c1",
     "c2",
@@ -172,6 +178,17 @@ FORCE_CONTROL_LOG_FIELDS = [
     "note",
 ]
 
+FORCE_FRAME_MAPPING_FIELDS = [
+    "timestamp",
+    "experiment_id",
+    "sensor_Fx_from",
+    "sensor_Fx_sign",
+    "sensor_Fy_from",
+    "sensor_Fy_sign",
+    "sensor_Fz_from",
+    "sensor_Fz_sign",
+]
+
 class CsvRecorder:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -183,6 +200,7 @@ class CsvRecorder:
         self.training_marker_file = None
         self.force_control_k_file = None
         self.force_control_log_file = None
+        self.force_frame_mapping_file = None
         self.raw_writer: Optional[csv.DictWriter] = None
         self.marker_writer: Optional[csv.DictWriter] = None
         self.cal_writer: Optional[csv.DictWriter] = None
@@ -191,6 +209,7 @@ class CsvRecorder:
         self.training_marker_writer: Optional[csv.DictWriter] = None
         self.force_control_k_writer: Optional[csv.DictWriter] = None
         self.force_control_log_writer: Optional[csv.DictWriter] = None
+        self.force_frame_mapping_writer: Optional[csv.DictWriter] = None
         self.zero_drift_index = 0
         self.active_zero_path: Optional[Path] = None
 
@@ -203,6 +222,7 @@ class CsvRecorder:
         self.training_marker_file = (self.output_dir / "training_markers.csv").open("w", newline="", encoding="utf-8-sig")
         self.force_control_k_file = (self.output_dir / "force_control_k.csv").open("w", newline="", encoding="utf-8-sig")
         self.force_control_log_file = (self.output_dir / "force_control_log.csv").open("w", newline="", encoding="utf-8-sig")
+        self.force_frame_mapping_file = (self.output_dir / "force_frame_mapping.csv").open("w", newline="", encoding="utf-8-sig")
         self.raw_writer = csv.DictWriter(self.raw_file, fieldnames=RAW_FIELDS)
         self.marker_writer = csv.DictWriter(self.marker_file, fieldnames=MARKER_FIELDS)
         self.cal_writer = csv.DictWriter(self.cal_file, fieldnames=CALIBRATION_FIELDS)
@@ -210,6 +230,7 @@ class CsvRecorder:
         self.training_marker_writer = csv.DictWriter(self.training_marker_file, fieldnames=TRAINING_MARKER_FIELDS)
         self.force_control_k_writer = csv.DictWriter(self.force_control_k_file, fieldnames=FORCE_CONTROL_K_FIELDS)
         self.force_control_log_writer = csv.DictWriter(self.force_control_log_file, fieldnames=FORCE_CONTROL_LOG_FIELDS)
+        self.force_frame_mapping_writer = csv.DictWriter(self.force_frame_mapping_file, fieldnames=FORCE_FRAME_MAPPING_FIELDS)
         self.raw_writer.writeheader()
         self.marker_writer.writeheader()
         self.cal_writer.writeheader()
@@ -217,6 +238,7 @@ class CsvRecorder:
         self.training_marker_writer.writeheader()
         self.force_control_k_writer.writeheader()
         self.force_control_log_writer.writeheader()
+        self.force_frame_mapping_writer.writeheader()
 
     def stop(self) -> None:
         self.stop_zero_drift_timeseries()
@@ -228,14 +250,16 @@ class CsvRecorder:
             self.training_marker_file,
             self.force_control_k_file,
             self.force_control_log_file,
+            self.force_frame_mapping_file,
         ):
             if file_obj:
                 file_obj.flush()
                 file_obj.close()
         self.raw_file = self.marker_file = self.cal_file = self.training_raw_file = self.training_marker_file = None
         self.force_control_k_file = self.force_control_log_file = None
+        self.force_frame_mapping_file = None
         self.raw_writer = self.marker_writer = self.cal_writer = self.training_raw_writer = self.training_marker_writer = None
-        self.force_control_k_writer = self.force_control_log_writer = None
+        self.force_control_k_writer = self.force_control_log_writer = self.force_frame_mapping_writer = None
 
     def write_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.raw_writer:
@@ -382,6 +406,15 @@ class CsvRecorder:
         self.force_control_log_writer.writerow(out)
         if self.force_control_log_file:
             self.force_control_log_file.flush()
+
+    def write_force_frame_mapping(self, row: dict) -> None:
+        if not self.force_frame_mapping_writer:
+            return
+        out = {field: row.get(field, "") for field in FORCE_FRAME_MAPPING_FIELDS}
+        out["timestamp"] = out["timestamp"] or utc_timestamp()
+        self.force_frame_mapping_writer.writerow(out)
+        if self.force_frame_mapping_file:
+            self.force_frame_mapping_file.flush()
 
     def __enter__(self) -> "CsvRecorder":
         self.start()

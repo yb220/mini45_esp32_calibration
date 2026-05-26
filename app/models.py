@@ -53,6 +53,12 @@ class CombinedSnapshot:
     mx: Optional[float] = None
     my: Optional[float] = None
     mz: Optional[float] = None
+    mini45_raw_fx: Optional[float] = None
+    mini45_raw_fy: Optional[float] = None
+    mini45_raw_fz: Optional[float] = None
+    mini45_raw_mx: Optional[float] = None
+    mini45_raw_my: Optional[float] = None
+    mini45_raw_mz: Optional[float] = None
     c0: Optional[float] = None
     c1: Optional[float] = None
     c2: Optional[float] = None
@@ -64,7 +70,8 @@ class CombinedSnapshot:
     esp_sequence: Optional[int] = None
 
     @classmethod
-    def from_force(cls, sample: ForceSample) -> "CombinedSnapshot":
+    def from_force(cls, sample: ForceSample, raw_sample: ForceSample | None = None) -> "CombinedSnapshot":
+        raw = raw_sample or sample
         return cls(
             timestamp=sample.timestamp,
             monotonic_s=sample.monotonic_s,
@@ -75,6 +82,12 @@ class CombinedSnapshot:
             mx=sample.mx,
             my=sample.my,
             mz=sample.mz,
+            mini45_raw_fx=raw.fx,
+            mini45_raw_fy=raw.fy,
+            mini45_raw_fz=raw.fz,
+            mini45_raw_mx=raw.mx,
+            mini45_raw_my=raw.my,
+            mini45_raw_mz=raw.mz,
             mini45_sequence=sample.sequence,
             mini45_status=sample.status,
         )

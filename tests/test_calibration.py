@@ -6,6 +6,8 @@ from app.calibration import (
     generate_shear_sequence,
     generate_training_trajectory,
     parse_force_levels,
+    training_target_reached,
+    training_target_timed_out,
 )
 from app.models import CombinedSnapshot, ExperimentMeta, ForceSample, SafetySettings, StabilitySettings
 from app.stability import evaluate_three_axis_stability
@@ -53,32 +55,64 @@ class CalibrationFlowTests(unittest.TestCase):
         self.assertEqual(parse_force_levels("7,3，5 3"), [3.0, 5.0, 7.0])
 
     def test_generate_training_fx_roundtrip(self):
-        segments = generate_training_trajectory(
+        targets = generate_training_trajectory(
             fz_levels=[0.5],
             shear_max=0.3,
             trajectory_type="fx_roundtrip",
-            force_rate_n_s=0.3,
-            hold_s=1.0,
-            recovery_s=1.0,
+            target_step_n=0.3,
         )
-        moving = [segment for segment in segments if segment.phase == "moving"]
-        self.assertEqual([segment.direction for segment in moving[:4]], ["positive", "positive", "negative", "negative"])
-        self.assertAlmostEqual(moving[0].end_fx, 0.3)
-        self.assertAlmostEqual(moving[2].end_fx, -0.3)
-        self.assertTrue(any(segment.phase == "recovery" for segment in segments))
+        target_phase = [target for target in targets if target.phase == "target"]
+        self.assertEqual([target.direction for target in target_phase[:4]], ["positive", "positive", "negative", "negative"])
+        self.assertAlmostEqual(target_phase[0].target_fx, 0.3)
+        self.assertAlmostEqual(target_phase[2].target_fx, -0.3)
+        self.assertTrue(any(target.phase == "recovery" for target in targets))
 
     def test_generate_training_diagonal_roundtrip(self):
-        segments = generate_training_trajectory(
+        targets = generate_training_trajectory(
             fz_levels=[1.0],
             shear_max=1.0,
             trajectory_type="diagonal_roundtrip",
-            force_rate_n_s=1.0,
-            hold_s=0.0,
-            recovery_s=0.0,
+            target_step_n=1.0,
         )
-        angles = [segment.target_angle_deg for segment in segments if segment.direction.startswith("angle_")]
+        angles = [target.target_angle_deg for target in targets if target.direction.startswith("angle_")]
         self.assertIn(45.0, angles)
         self.assertIn(315.0, angles)
+
+    def test_generate_training_fy_roundtrip(self):
+        targets = generate_training_trajectory(
+            fz_levels=[0.5],
+            shear_max=0.3,
+            trajectory_type="fy_roundtrip",
+            target_step_n=0.3,
+        )
+        target_phase = [target for target in targets if target.phase == "target"]
+        self.assertAlmostEqual(target_phase[0].target_fy, 0.3)
+        self.assertAlmostEqual(target_phase[2].target_fy, -0.3)
+
+    def test_training_random_targets_are_inside_shear_disk_and_not_fixed(self):
+        first = generate_training_trajectory([1.0], 1.0, "random_perturb", random_points=8)
+        second = generate_training_trajectory([1.0], 1.0, "random_perturb", random_points=8)
+        first_random = [target for target in first if target.direction.startswith("random_")]
+        second_random = [target for target in second if target.direction.startswith("random_")]
+        self.assertEqual(len(first_random), 8)
+        self.assertTrue(all(target.target_shear_n <= 1.0 for target in first_random))
+        self.assertNotEqual(
+            [(target.target_fx, target.target_fy) for target in first_random],
+            [(target.target_fx, target.target_fy) for target in second_random],
+        )
+
+    def test_training_circular_shear_is_removed(self):
+        with self.assertRaises(ValueError):
+            generate_training_trajectory([1.0], 1.0, "circular_shear")
+
+    def test_training_target_reached_uses_sensor_frame_force(self):
+        target = next(target for target in generate_training_trajectory([0.5], 0.3, "fx_roundtrip", target_step_n=0.3) if target.phase == "target")
+        sensor_force = ForceSample("t", 1.0, fx=0.29, fy=0.01, fz=0.51, mx=0.0, my=0.0, mz=0.0)
+        self.assertTrue(training_target_reached(sensor_force, target, 0.05))
+
+    def test_training_target_timeout(self):
+        self.assertFalse(training_target_timed_out(59.9, 60.0))
+        self.assertTrue(training_target_timed_out(60.0, 60.0))
 
 
 if __name__ == "__main__":

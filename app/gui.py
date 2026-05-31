@@ -33,11 +33,13 @@ import pyqtgraph as pg
 from .buffers import SampleBuffer
 from .calibration import (
     CalibrationTarget,
-    TrainingSegment,
+    TrainingTarget,
     generate_training_trajectory,
     generate_fz_sequence,
     generate_shear_sequence,
     parse_force_levels,
+    training_target_reached,
+    training_target_timed_out,
 )
 from .arduino_motion import (
     ArduinoMotionAdapter,
@@ -117,10 +119,10 @@ class MainWindow(QMainWindow):
         self.zero_drift_file = ""
         self.training_count = 0
         self.training_active = False
-        self.training_segments: list[TrainingSegment] = []
-        self.training_segment_index = 0
-        self.training_segment_start_s = 0.0
-        self.training_current_segment: TrainingSegment | None = None
+        self.training_targets: list[TrainingTarget] = []
+        self.training_target_index = 0
+        self.training_target_start_s = 0.0
+        self.training_current_target: TrainingTarget | None = None
         self.training_pause_started_s = 0.0
         self.force_control_result = None
         self.force_control_state = DecoupledControlState()
@@ -521,18 +523,23 @@ class MainWindow(QMainWindow):
         self.training_trajectory_type.addItem("Fx往返", "fx_roundtrip")
         self.training_trajectory_type.addItem("Fy往返", "fy_roundtrip")
         self.training_trajectory_type.addItem("斜向往返", "diagonal_roundtrip")
-        self.training_trajectory_type.addItem("圆形剪切", "circular_shear")
         self.training_trajectory_type.addItem("随机小幅扰动", "random_perturb")
+        self.training_trajectory_type.currentIndexChanged.connect(self.update_calibration_mode_ui)
         self.training_shear_max = self._spin(0.0, 4.0, 3.6)
-        self.training_force_rate = self._spin(0.01, 2.0, 0.2)
-        self.training_hold_s = self._spin(0.0, 60.0, 5.0)
-        self.training_recovery_s = self._spin(0.0, 120.0, 10.0)
+        self.training_target_step = self._spin(0.02, 2.0, 0.2)
+        self.training_arrival_window = self._spin(0.01, 1.0, 0.15)
+        self.training_max_wait_s = self._spin(1.0, 300.0, 60.0)
+        self.training_random_points = QSpinBox()
+        self.training_random_points.setRange(1, 500)
+        self.training_random_points.setValue(30)
         form.addRow("Fz 层级 N", self.training_fz_levels)
         form.addRow("轨迹类型", self.training_trajectory_type)
         form.addRow("剪切最大力 N", self.training_shear_max)
-        form.addRow("力目标变化速率 N/s", self.training_force_rate)
-        form.addRow("端点保持时间 s", self.training_hold_s)
-        form.addRow("回零保持时间 s", self.training_recovery_s)
+        form.addRow("目标步距 N", self.training_target_step)
+        form.addRow("训练到达窗口 N", self.training_arrival_window)
+        form.addRow("最大等待时间 s", self.training_max_wait_s)
+        self.training_random_points_label = QLabel("随机点数")
+        form.addRow(self.training_random_points_label, self.training_random_points)
         layout.addWidget(self.combined_group)
 
         buttons = QHBoxLayout()
@@ -620,6 +627,9 @@ class MainWindow(QMainWindow):
         self.target_group.setVisible(is_single or is_sequence)
         self.sequence_group.setVisible(is_sequence)
         self.combined_group.setVisible(is_combined)
+        random_training = is_combined and self._combo_value(self.training_trajectory_type) == "random_perturb"
+        self.training_random_points_label.setVisible(random_training)
+        self.training_random_points.setVisible(random_training)
 
         shear_axis = axis in {"Fx", "Fy"}
         for widget in (self.seq_fz_label, self.seq_fz_max, self.seq_fz_step):
@@ -1202,88 +1212,91 @@ class MainWindow(QMainWindow):
     def start_training_collection(self) -> None:
         try:
             fz_levels = parse_force_levels(self.training_fz_levels.text())
-            self.training_segments = generate_training_trajectory(
+            self.training_targets = generate_training_trajectory(
                 fz_levels=fz_levels,
                 shear_max=self.training_shear_max.value(),
                 trajectory_type=self._combo_value(self.training_trajectory_type),
-                force_rate_n_s=self.training_force_rate.value(),
-                hold_s=self.training_hold_s.value(),
-                recovery_s=self.training_recovery_s.value(),
+                target_step_n=self.training_target_step.value(),
+                random_points=self.training_random_points.value(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "训练数据采集", str(exc))
             return
-        if not self.training_segments:
+        if not self.training_targets:
             QMessageBox.warning(self, "训练数据采集", "当前参数没有生成训练轨迹")
             return
 
         self.training_count += 1
         self.current_cycle_id = f"training_{self.training_count:03d}"
         self.training_active = True
-        self.training_segment_index = 0
-        self.training_current_segment = None
+        self.training_target_index = 0
+        self.training_current_target = None
         if self.recorder:
             self.recorder.start_training_files()
         self._write_training_marker("training_start")
-        self._enter_training_segment(0)
+        self._enter_training_target(0)
         self.start_auto_force()
         if not self.auto_force_active:
             self.finish_training_collection("启动失败")
             return
         self._log("训练数据采集开始：仅写入 training_raw_timeseries.csv 和 training_markers.csv")
 
-    def _enter_training_segment(self, index: int) -> None:
-        self.training_segment_index = index
-        self.training_current_segment = self.training_segments[index]
-        self.training_segment_start_s = time.monotonic()
-        self._set_training_target(self.training_current_segment.target_at(0.0))
-        self._write_training_marker(self._training_marker_note(self.training_current_segment))
+    def _enter_training_target(self, index: int) -> None:
+        self.training_target_index = index
+        self.training_current_target = self.training_targets[index]
+        self.training_target_start_s = time.monotonic()
+        self._set_training_target(self.training_current_target)
+        self._write_training_marker(self._training_start_marker_note(index))
 
-    def _set_training_target(self, target) -> None:
+    def _set_training_target(self, target: TrainingTarget) -> None:
         self.active_target = CalibrationTarget(
             axis="combined",
-            direction=self.training_current_segment.direction if self.training_current_segment else "none",
-            branch=self.training_current_segment.branch if self.training_current_segment else "loading",
+            direction=target.direction,
+            branch=target.branch,
             target_fx=target.target_fx,
             target_fy=target.target_fy,
             target_fz=target.target_fz,
         )
 
-    def _training_marker_note(self, segment: TrainingSegment) -> str:
-        if segment.phase == "preload":
+    def _training_start_marker_note(self, index: int) -> str:
+        target = self.training_targets[index]
+        previous = self.training_targets[index - 1] if index > 0 else None
+        if target.phase == "preload" and (previous is None or previous.phase != "preload"):
             return "fz_level_start"
-        if segment.phase == "holding":
-            return "hold_start"
-        if segment.phase == "recovery":
+        if target.phase == "recovery" and (previous is None or previous.phase != "recovery"):
             return "recovery_start"
-        return "segment_start"
+        return "target_start"
 
     def _update_training_collection(self) -> None:
         if not self.training_active or self.calibration_paused:
             return
-        if not self.training_current_segment:
+        if not self.training_current_target:
             return
         now = time.monotonic()
-        elapsed = now - self.training_segment_start_s
-        while self.training_current_segment and elapsed >= self.training_current_segment.duration_s:
-            self._set_training_target(self.training_current_segment.target_at(self.training_current_segment.duration_s))
-            self._write_training_marker("segment_end")
-            next_index = self.training_segment_index + 1
-            if next_index >= len(self.training_segments):
-                self.stop_calibration("训练数据采集完成")
-                return
-            self._enter_training_segment(next_index)
-            now = time.monotonic()
-            elapsed = now - self.training_segment_start_s
+        elapsed = now - self.training_target_start_s
+        target = self.training_current_target
+        if self.latest_force_sample and training_target_reached(self.latest_force_sample, target, self.training_arrival_window.value()):
+            self._write_training_marker("target_reached")
+            self._advance_training_target()
+            return
+        if training_target_timed_out(elapsed, self.training_max_wait_s.value()):
+            self._write_training_marker("target_timeout")
+            self._write_training_marker("target_skipped")
+            self._advance_training_target()
+            return
+        self.cal_status.setText(
+            f"训练采集：{self.training_target_index + 1}/{len(self.training_targets)}，"
+            f"{target.phase}，目标 Fx={target.target_fx:.3f}, "
+            f"Fy={target.target_fy:.3f}, Fz={target.target_fz:.3f}，"
+            f"等待 {elapsed:.1f}/{self.training_max_wait_s.value():.1f}s"
+        )
 
-        if self.training_current_segment:
-            target = self.training_current_segment.target_at(elapsed)
-            self._set_training_target(target)
-            self.cal_status.setText(
-                f"训练采集：{self.training_segment_index + 1}/{len(self.training_segments)}，"
-                f"{self.training_current_segment.phase}，目标 Fx={target.target_fx:.3f}, "
-                f"Fy={target.target_fy:.3f}, Fz={target.target_fz:.3f}"
-            )
+    def _advance_training_target(self) -> None:
+        next_index = self.training_target_index + 1
+        if next_index >= len(self.training_targets):
+            self.stop_calibration("训练数据采集完成")
+            return
+        self._enter_training_target(next_index)
 
     def finish_training_collection(self, reason: str = "停止") -> None:
         if not self.training_active:
@@ -1292,9 +1305,9 @@ class MainWindow(QMainWindow):
         if self.recorder:
             self.recorder.stop_training_files()
         self.training_active = False
-        self.training_segments = []
-        self.training_segment_index = 0
-        self.training_current_segment = None
+        self.training_targets = []
+        self.training_target_index = 0
+        self.training_current_target = None
         self.training_pause_started_s = 0.0
         self._log(f"训练数据采集结束：{reason}")
 
@@ -1304,13 +1317,12 @@ class MainWindow(QMainWindow):
         self.marker_id += 1
         meta = self._meta()
         meta.note = f"{meta.note}; {note}" if meta.note else note
-        segment = self.training_current_segment
-        target = segment.target_at(time.monotonic() - self.training_segment_start_s) if segment else None
+        target = self.training_current_target
         self.recorder.write_training_marker(
             self.marker_id,
             meta,
-            trajectory_type=segment.trajectory_type if segment else self._combo_value(self.training_trajectory_type),
-            phase=segment.phase if segment else note,
+            trajectory_type=target.trajectory_type if target else self._combo_value(self.training_trajectory_type),
+            phase=target.phase if target else note,
             target_shear_n=target.target_shear_n if target else "",
             target_angle_deg=target.target_angle_deg if target else "",
         )
@@ -1330,12 +1342,16 @@ class MainWindow(QMainWindow):
         if not self.calibration_mode:
             return
         if self.training_active and self.training_pause_started_s > 0.0:
-            self.training_segment_start_s += time.monotonic() - self.training_pause_started_s
+            self.training_target_start_s += time.monotonic() - self.training_pause_started_s
             self.training_pause_started_s = 0.0
         self.calibration_paused = False
         self.cal_status.setText("标定状态：继续")
 
     def skip_calibration_point(self) -> None:
+        if self.training_active:
+            self._write_training_marker("target_skipped")
+            self._advance_training_target()
+            return
         if self.calibration_mode == "sequence":
             self.sequence_index += 1
             self.start_next_sequence_target()
@@ -1353,7 +1369,7 @@ class MainWindow(QMainWindow):
         self.sequence_targets = []
         self.sequence_index = 0
         self.active_target = None
-        self.training_current_segment = None
+        self.training_current_target = None
         if reason:
             self.cal_status.setText(f"标定状态：{reason}")
 
@@ -1643,10 +1659,8 @@ class MainWindow(QMainWindow):
 
         if all_in_window:
             if self.training_active:
-                try:
-                    self.motion.stop_all()
-                except Exception:
-                    pass
+                # 训练采集由 _update_training_collection 负责到达后立即切换目标，
+                # 这里不停车等待，避免连续加载数据出现人为停顿。
                 return
             if not self.auto_force_holding:
                 self.auto_force_holding = True

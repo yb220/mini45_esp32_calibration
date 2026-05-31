@@ -50,49 +50,16 @@ class ControlChoice:
 
 @dataclass
 class TrainingTarget:
-    target_fx: float
-    target_fy: float
-    target_fz: float
-    target_shear_n: float = 0.0
-    target_angle_deg: float | str = ""
-
-
-@dataclass
-class TrainingSegment:
     trajectory_type: str
     phase: str
     axis: str
     direction: str
     branch: str
-    start_fx: float
-    start_fy: float
-    start_fz: float
-    end_fx: float
-    end_fy: float
-    end_fz: float
-    duration_s: float
+    target_fx: float
+    target_fy: float
+    target_fz: float
     target_shear_n: float = 0.0
     target_angle_deg: float | str = ""
-
-    def target_at(self, elapsed_s: float) -> TrainingTarget:
-        if self.duration_s <= 0:
-            ratio = 1.0
-        else:
-            ratio = min(max(float(elapsed_s) / self.duration_s, 0.0), 1.0)
-        fx = self.start_fx + (self.end_fx - self.start_fx) * ratio
-        fy = self.start_fy + (self.end_fy - self.start_fy) * ratio
-        fz = self.start_fz + (self.end_fz - self.start_fz) * ratio
-        shear = math.hypot(fx, fy)
-        angle: float | str = self.target_angle_deg
-        if shear > 1e-9:
-            angle = _round_force((math.degrees(math.atan2(fy, fx)) + 360.0) % 360.0)
-        return TrainingTarget(
-            target_fx=_round_force(fx),
-            target_fy=_round_force(fy),
-            target_fz=_round_force(fz),
-            target_shear_n=_round_force(shear if shear > 1e-9 else self.target_shear_n),
-            target_angle_deg=angle,
-        )
 
 
 def _round_force(value: float) -> float:
@@ -163,14 +130,38 @@ def parse_force_levels(text: str) -> list[float]:
     return values
 
 
-def _move_duration(start: tuple[float, float, float], end: tuple[float, float, float], rate_n_s: float) -> float:
-    rate = max(float(rate_n_s), 1e-6)
-    delta = max(abs(end[0] - start[0]), abs(end[1] - start[1]), abs(end[2] - start[2]))
-    return 0.0 if delta <= 1e-9 else max(delta / rate, 0.05)
+def _append_training_target(
+    targets: list[TrainingTarget],
+    trajectory_type: str,
+    force: tuple[float, float, float],
+    phase: str,
+    axis: str,
+    direction: str,
+    branch: str,
+    target_angle_deg: float | str = "",
+) -> None:
+    shear = math.hypot(force[0], force[1])
+    angle: float | str = target_angle_deg
+    if shear > 1e-9 and angle == "":
+        angle = _round_force((math.degrees(math.atan2(force[1], force[0])) + 360.0) % 360.0)
+    targets.append(
+        TrainingTarget(
+            trajectory_type=trajectory_type,
+            phase=phase,
+            axis=axis,
+            direction=direction,
+            branch=branch,
+            target_fx=_round_force(force[0]),
+            target_fy=_round_force(force[1]),
+            target_fz=_round_force(force[2]),
+            target_shear_n=_round_force(shear),
+            target_angle_deg=angle,
+        )
+    )
 
 
-def _append_move(
-    segments: list[TrainingSegment],
+def _append_target_line(
+    targets: list[TrainingTarget],
     trajectory_type: str,
     current: tuple[float, float, float],
     end: tuple[float, float, float],
@@ -178,64 +169,32 @@ def _append_move(
     axis: str,
     direction: str,
     branch: str,
-    rate_n_s: float,
+    target_step_n: float,
     target_angle_deg: float | str = "",
 ) -> tuple[float, float, float]:
-    duration = _move_duration(current, end, rate_n_s)
-    if duration <= 0.0:
+    distance = math.sqrt(sum((end[index] - current[index]) ** 2 for index in range(3)))
+    if distance <= 1e-9:
         return end
-    segments.append(
-        TrainingSegment(
+    step = max(float(target_step_n), 0.02)
+    count = max(1, int(math.ceil(distance / step)))
+    for point in range(1, count + 1):
+        ratio = point / count
+        force = (
+            current[0] + (end[0] - current[0]) * ratio,
+            current[1] + (end[1] - current[1]) * ratio,
+            current[2] + (end[2] - current[2]) * ratio,
+        )
+        _append_training_target(
+            targets,
             trajectory_type=trajectory_type,
             phase=phase,
             axis=axis,
             direction=direction,
             branch=branch,
-            start_fx=_round_force(current[0]),
-            start_fy=_round_force(current[1]),
-            start_fz=_round_force(current[2]),
-            end_fx=_round_force(end[0]),
-            end_fy=_round_force(end[1]),
-            end_fz=_round_force(end[2]),
-            duration_s=duration,
-            target_shear_n=_round_force(math.hypot(end[0], end[1])),
+            force=force,
             target_angle_deg=target_angle_deg,
         )
-    )
     return end
-
-
-def _append_hold(
-    segments: list[TrainingSegment],
-    trajectory_type: str,
-    current: tuple[float, float, float],
-    duration_s: float,
-    phase: str,
-    axis: str,
-    direction: str,
-    branch: str,
-    target_angle_deg: float | str = "",
-) -> None:
-    if duration_s <= 0:
-        return
-    segments.append(
-        TrainingSegment(
-            trajectory_type=trajectory_type,
-            phase=phase,
-            axis=axis,
-            direction=direction,
-            branch=branch,
-            start_fx=_round_force(current[0]),
-            start_fy=_round_force(current[1]),
-            start_fz=_round_force(current[2]),
-            end_fx=_round_force(current[0]),
-            end_fy=_round_force(current[1]),
-            end_fz=_round_force(current[2]),
-            duration_s=float(duration_s),
-            target_shear_n=_round_force(math.hypot(current[0], current[1])),
-            target_angle_deg=target_angle_deg,
-        )
-    )
 
 
 def _polar_target(shear_n: float, angle_deg: float, fz: float) -> tuple[float, float, float]:
@@ -247,18 +206,20 @@ def generate_training_trajectory(
     fz_levels: list[float],
     shear_max: float,
     trajectory_type: str,
-    force_rate_n_s: float,
-    hold_s: float,
-    recovery_s: float,
-) -> list[TrainingSegment]:
+    target_step_n: float = 0.2,
+    random_points: int = 30,
+    rng: random.Random | None = None,
+) -> list[TrainingTarget]:
     if shear_max < 0:
         raise ValueError("shear_max must be non-negative")
-    segments: list[TrainingSegment] = []
+    if random_points <= 0:
+        raise ValueError("random_points must be positive")
+    targets: list[TrainingTarget] = []
     current = (0.0, 0.0, 0.0)
-    rng = random.Random(20260522)
+    rng = rng or random.Random()
 
     for fz in fz_levels:
-        current = _append_move(segments, trajectory_type, current, (0.0, 0.0, fz), "preload", "combined", "none", "loading", force_rate_n_s)
+        current = _append_target_line(targets, trajectory_type, current, (0.0, 0.0, fz), "preload", "combined", "none", "loading", target_step_n)
 
         if trajectory_type == "fx_roundtrip":
             moves = [
@@ -268,8 +229,7 @@ def generate_training_trajectory(
                 ((0.0, 0.0, fz), "negative", "unloading"),
             ]
             for end, direction, branch in moves:
-                current = _append_move(segments, trajectory_type, current, end, "moving", "combined", direction, branch, force_rate_n_s)
-                _append_hold(segments, trajectory_type, current, hold_s, "holding", "combined", direction, branch)
+                current = _append_target_line(targets, trajectory_type, current, end, "target", "combined", direction, branch, target_step_n)
 
         elif trajectory_type == "fy_roundtrip":
             moves = [
@@ -279,37 +239,42 @@ def generate_training_trajectory(
                 ((0.0, 0.0, fz), "negative", "unloading"),
             ]
             for end, direction, branch in moves:
-                current = _append_move(segments, trajectory_type, current, end, "moving", "combined", direction, branch, force_rate_n_s)
-                _append_hold(segments, trajectory_type, current, hold_s, "holding", "combined", direction, branch)
+                current = _append_target_line(targets, trajectory_type, current, end, "target", "combined", direction, branch, target_step_n)
 
         elif trajectory_type == "diagonal_roundtrip":
             for angle in (45.0, 135.0, 225.0, 315.0):
-                current = _append_move(segments, trajectory_type, current, _polar_target(shear_max, angle, fz), "moving", "combined", f"angle_{int(angle):03d}", "loading", force_rate_n_s, angle)
-                _append_hold(segments, trajectory_type, current, hold_s, "holding", "combined", f"angle_{int(angle):03d}", "loading", angle)
-                current = _append_move(segments, trajectory_type, current, (0.0, 0.0, fz), "moving", "combined", f"angle_{int(angle):03d}", "unloading", force_rate_n_s, angle)
-                _append_hold(segments, trajectory_type, current, hold_s, "holding", "combined", f"angle_{int(angle):03d}", "unloading", angle)
-
-        elif trajectory_type == "circular_shear":
-            current = _append_move(segments, trajectory_type, current, _polar_target(shear_max, 0.0, fz), "moving", "combined", "circular", "loading", force_rate_n_s, 0.0)
-            for angle in (45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0, 360.0):
-                current = _append_move(segments, trajectory_type, current, _polar_target(shear_max, angle, fz), "moving", "combined", "circular", "loading", force_rate_n_s, angle)
-            current = _append_move(segments, trajectory_type, current, (0.0, 0.0, fz), "moving", "combined", "circular", "unloading", force_rate_n_s)
-            _append_hold(segments, trajectory_type, current, hold_s, "holding", "combined", "circular", "unloading")
+                current = _append_target_line(targets, trajectory_type, current, _polar_target(shear_max, angle, fz), "target", "combined", f"angle_{int(angle):03d}", "loading", target_step_n, angle)
+                current = _append_target_line(targets, trajectory_type, current, (0.0, 0.0, fz), "target", "combined", f"angle_{int(angle):03d}", "unloading", target_step_n, angle)
 
         elif trajectory_type == "random_perturb":
-            for index in range(8):
-                radius = shear_max * rng.uniform(0.2, 1.0)
+            for index in range(int(random_points)):
+                # sqrt(random) 使随机点在剪切圆盘面积内近似均匀分布，而不是集中在圆心。
+                radius = shear_max * math.sqrt(rng.random())
                 angle = rng.uniform(0.0, 360.0)
-                current = _append_move(segments, trajectory_type, current, _polar_target(radius, angle, fz), "moving", "combined", f"random_{index + 1:02d}", "loading", force_rate_n_s, _round_force(angle))
-            current = _append_move(segments, trajectory_type, current, (0.0, 0.0, fz), "moving", "combined", "random", "unloading", force_rate_n_s)
+                target = _polar_target(radius, angle, fz)
+                _append_training_target(targets, trajectory_type, target, "target", "combined", f"random_{index + 1:02d}", "loading", _round_force(angle))
+                current = target
+            current = _append_target_line(targets, trajectory_type, current, (0.0, 0.0, fz), "target", "combined", "random", "unloading", target_step_n)
 
         else:
             raise ValueError(f"unknown trajectory_type: {trajectory_type}")
 
-        current = _append_move(segments, trajectory_type, current, (0.0, 0.0, 0.0), "recovery", "combined", "none", "unloading", force_rate_n_s)
-        _append_hold(segments, trajectory_type, current, recovery_s, "recovery", "combined", "none", "unloading")
+        current = _append_target_line(targets, trajectory_type, current, (0.0, 0.0, 0.0), "recovery", "combined", "none", "unloading", target_step_n)
 
-    return segments
+    return targets
+
+
+def training_target_reached(force: ForceSample, target: TrainingTarget, arrival_window_n: float) -> bool:
+    window = max(float(arrival_window_n), 0.0)
+    return (
+        abs(float(force.fx) - target.target_fx) <= window
+        and abs(float(force.fy) - target.target_fy) <= window
+        and abs(float(force.fz) - target.target_fz) <= window
+    )
+
+
+def training_target_timed_out(elapsed_s: float, max_wait_s: float) -> bool:
+    return float(elapsed_s) >= max(float(max_wait_s), 0.0)
 
 
 def target_for_axis(meta: ExperimentMeta, axis: str) -> float:
@@ -334,4 +299,3 @@ def choose_control_axis(force: ForceSample, meta: ExperimentMeta, settings: Stab
         choices.append((normalized, axis, error, measured, target, tolerance))
     _, axis, error, measured, target, tolerance = max(choices, key=lambda item: item[0])
     return ControlChoice(axis, error, measured, target, tolerance, all_in_window)
-

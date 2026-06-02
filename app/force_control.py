@@ -51,6 +51,8 @@ class DecoupledControlSettings:
     style: str = "standard"
     target_condition: float = 50.0
     safety_fraction: float = 0.50
+    min_effective_step_mm: float = 0.0
+    coarse_error_n: float = 0.20
 
 
 @dataclass
@@ -298,9 +300,9 @@ def update_trust_scale(
     style: str,
 ) -> tuple[float, str]:
     limits = {
-        "conservative": (0.15, 0.70, 0.25),
-        "standard": (0.20, 1.00, 0.40),
-        "fast": (0.30, 1.40, 0.60),
+        "conservative": (0.15, 0.90, 0.35),
+        "standard": (0.30, 1.80, 0.75),
+        "fast": (0.50, 3.00, 1.20),
     }
     min_scale, max_scale, initial = limits.get(style, limits["standard"])
     note = ""
@@ -317,8 +319,11 @@ def update_trust_scale(
     if sign_changed or error_norm > previous_norm * 1.05:
         state.trust_scale = max(min_scale, state.trust_scale * 0.50)
         note = "误差增大或换向，减小信任域"
+    elif error_norm > previous_norm * 0.95:
+        state.trust_scale = min(max_scale, state.trust_scale * 1.15)
+        note = "误差下降过慢，放大信任域"
     elif error_norm < previous_norm * 0.80:
-        state.trust_scale = min(max_scale, state.trust_scale * 1.20)
+        state.trust_scale = min(max_scale, state.trust_scale * 1.25)
         note = "误差下降，放大信任域"
     else:
         state.trust_scale = min(max_scale, max(min_scale, state.trust_scale))
@@ -330,6 +335,24 @@ def _scale_to_max_abs(vector: list[float], max_abs: float) -> list[float]:
     if max_value <= float(max_abs) or max_value <= 1e-12:
         return list(vector)
     return _mul_scalar(vector, float(max_abs) / max_value)
+
+
+def _style_force_fraction(style: str) -> float:
+    return {
+        "conservative": 0.60,
+        "standard": 0.95,
+        "fast": 1.20,
+    }.get(style, 0.95)
+
+
+def _scale_to_min_abs(vector: list[float], min_abs: float, max_abs: float) -> list[float]:
+    max_value = max(abs(float(value)) for value in vector) if vector else 0.0
+    if max_value <= 1e-12 or max_value >= float(min_abs):
+        return list(vector)
+    target = min(float(max_abs), float(min_abs))
+    if target <= max_value:
+        return list(vector)
+    return _mul_scalar(vector, target / max_value)
 
 
 def _safety_limited_force_delta(
@@ -374,12 +397,20 @@ def compute_decoupled_command(
     # 先限制位移，再限制预测力变化，避免病态矩阵或大误差导致单步过冲。
     limited = _scale_to_max_abs(limited, settings.max_step_mm)
     predicted = _matvec(k, limited)
-    max_predicted = max(0.03, _norm(error) * 0.80)
+    max_predicted = max(0.03, _norm(error) * _style_force_fraction(settings.style))
     predicted = _scale_to_max_abs(predicted, max_predicted)
     predicted = _safety_limited_force_delta(predicted, current_force, safety, settings.safety_fraction)
     current_predicted_norm = _norm(_matvec(k, limited))
     if current_predicted_norm > 1e-12 and _norm(predicted) > 1e-12:
         limited = _mul_scalar(limited, min(1.0, _norm(predicted) / current_predicted_norm))
+
+    # 误差还比较大时，避免长期发送机械上几乎不可见的微小位移。
+    if settings.min_effective_step_mm > 0.0 and _norm(error) >= settings.coarse_error_n:
+        candidate = _scale_to_min_abs(limited, settings.min_effective_step_mm, settings.max_step_mm)
+        candidate_predicted_norm = _norm(_matvec(k, candidate))
+        if candidate_predicted_norm <= max(0.05, _norm(error) * 1.50):
+            limited = candidate
+            note = f"{note}；应用最小有效步长" if note else "应用最小有效步长"
 
     quantized = []
     for value in limited:

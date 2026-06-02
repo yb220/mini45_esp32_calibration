@@ -375,9 +375,11 @@ class MainWindow(QMainWindow):
         self.auto_step_mm.setSingleStep(MM_PER_PULSE)
         self.auto_speed_mm_s = self._spin(0.001, 20.0, AUTO_DEFAULT_SPEED_MM_S)
         self.auto_speed_mm_s.setSingleStep(0.1)
-        self.k_delta_x = self._spin(MM_PER_PULSE, 0.5, 0.05)
-        self.k_delta_y = self._spin(MM_PER_PULSE, 0.5, 0.05)
-        self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.05)
+        self.auto_min_effective_step_mm = self._spin(0.0, 0.5, 0.02)
+        self.auto_min_effective_step_mm.setSingleStep(MM_PER_PULSE)
+        self.k_delta_x = self._spin(MM_PER_PULSE, 0.5, 0.10)
+        self.k_delta_y = self._spin(MM_PER_PULSE, 0.5, 0.10)
+        self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.10)
         for spin in (self.k_delta_x, self.k_delta_y, self.k_delta_z):
             spin.setSingleStep(MM_PER_PULSE)
         self.k_wait_s = self._spin(0.1, 5.0, 1.0)
@@ -397,6 +399,7 @@ class MainWindow(QMainWindow):
         self.control_style.addItem("保守", "conservative")
         self.control_style.addItem("标准", "standard")
         self.control_style.addItem("快速", "fast")
+        self._set_combo_by_data(self.control_style, "standard")
 
         grid.addWidget(QLabel("Mini45上位机滤波"), 0, 0)
         grid.addWidget(self.force_filter_enabled, 0, 1)
@@ -428,6 +431,9 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("控制风格"), 5, 2)
         grid.addWidget(self.control_style, 5, 3)
 
+        grid.addWidget(QLabel("最小有效步 mm"), 6, 0)
+        grid.addWidget(self.auto_min_effective_step_mm, 6, 1)
+
         k_buttons = QHBoxLayout()
         self.k_ident_btn = QPushButton("自动辨识 K")
         self.k_ident_btn.clicked.connect(self.start_k_identification)
@@ -435,10 +441,10 @@ class MainWindow(QMainWindow):
         self.k_clear_btn.clicked.connect(self.clear_force_control_k)
         k_buttons.addWidget(self.k_ident_btn)
         k_buttons.addWidget(self.k_clear_btn)
-        grid.addLayout(k_buttons, 6, 0, 1, 4)
+        grid.addLayout(k_buttons, 7, 0, 1, 4)
 
         self.k_status = QLabel("K 状态：未辨识")
-        grid.addWidget(self.k_status, 7, 0, 1, 4)
+        grid.addWidget(self.k_status, 8, 0, 1, 4)
         return box
 
     def _build_calibration_group(self) -> QGroupBox:
@@ -1845,6 +1851,7 @@ class MainWindow(QMainWindow):
                     max_step_mm=self.auto_step_mm.value(),
                     min_pulse=1,
                     style=self._combo_value(self.control_style),
+                    min_effective_step_mm=self.auto_min_effective_step_mm.value(),
                 ),
                 safety=SafetySettings(),
                 noise_norm=self.force_control_result.noise_norm,

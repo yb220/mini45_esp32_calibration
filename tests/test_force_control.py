@@ -56,7 +56,7 @@ class ForceControlTests(unittest.TestCase):
         self.assertGreater(command.delta_mm["X"], 0.0)
         self.assertGreater(command.delta_mm["Y"], 0.0)
         self.assertGreater(command.delta_mm["Z"], 0.0)
-        self.assertAlmostEqual(command.delta_mm["X"] % 0.005, 0.0, places=9)
+        self.assertAlmostEqual(command.delta_mm["X"], round(command.delta_mm["X"] / 0.005) * 0.005, places=9)
 
     def test_trust_scale_shrinks_when_error_increases(self):
         k = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -70,6 +70,37 @@ class ForceControlTests(unittest.TestCase):
             safety=SafetySettings(),
         )
         self.assertLess(command.trust_scale, 1.0)
+
+    def test_trust_scale_grows_when_progress_is_too_slow(self):
+        k = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        state = DecoupledControlState(previous_error=[1.0, 0.0, 0.0], trust_scale=0.5)
+        command = compute_decoupled_command(
+            k=k,
+            target_force=[0.98, 0.0, 0.0],
+            current_force=[0.0, 0.0, 0.0],
+            state=state,
+            settings=DecoupledControlSettings(max_step_mm=1.0, style="standard"),
+            safety=SafetySettings(),
+        )
+        self.assertGreater(command.trust_scale, 0.5)
+
+    def test_min_effective_step_avoids_tiny_far_from_target_moves(self):
+        k = [[50.0, 0.0, 0.0], [0.0, 50.0, 0.0], [0.0, 0.0, 50.0]]
+        state = DecoupledControlState()
+        command = compute_decoupled_command(
+            k=k,
+            target_force=[1.0, 0.0, 0.0],
+            current_force=[0.0, 0.0, 0.0],
+            state=state,
+            settings=DecoupledControlSettings(
+                max_step_mm=0.1,
+                style="standard",
+                min_effective_step_mm=0.02,
+                coarse_error_n=0.2,
+            ),
+            safety=SafetySettings(),
+        )
+        self.assertGreaterEqual(abs(command.delta_mm["X"]), 0.02)
 
 
 if __name__ == "__main__":

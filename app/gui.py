@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -60,6 +61,7 @@ from .arduino_motion import (
     parse_axis_position,
 )
 from .esp32_serial import Esp32Log, Esp32SerialAdapter
+from .force_filter import ForceFilterSettings, ForceLowPassFilter
 from .force_frame import AxisFrameMap, ForceFrameMapping, transform_force_sample
 from .force_control import (
     MOTOR_AXES,
@@ -98,6 +100,7 @@ class MainWindow(QMainWindow):
         self.last_force_time = 0.0
         self.last_cap_time = 0.0
         self.latest_force_sample: ForceSample | None = None
+        self.force_filter = ForceLowPassFilter()
         self.motion_positions = {"X": None, "Y": None, "Z": None}
         self.auto_force_active = False
         self.auto_force_holding = False
@@ -367,35 +370,53 @@ class MainWindow(QMainWindow):
         self.k_delta_z = self._spin(MM_PER_PULSE, 0.5, 0.05)
         for spin in (self.k_delta_x, self.k_delta_y, self.k_delta_z):
             spin.setSingleStep(MM_PER_PULSE)
-        self.k_wait_s = self._spin(0.1, 5.0, 0.5)
-        self.k_sample_s = self._spin(0.1, 5.0, 0.5)
+        self.k_wait_s = self._spin(0.1, 5.0, 1.0)
+        self.k_sample_s = self._spin(0.1, 5.0, 1.0)
         self.k_condition_limit = self._spin(10.0, 1000.0, 300.0)
+        self.force_filter_enabled = QCheckBox("启用")
+        self.force_filter_enabled.setChecked(True)
+        self.force_filter_cutoff_hz = self._spin(0.1, 30.0, 3.0)
+        self.force_filter_cutoff_hz.setSingleStep(0.5)
+        self.force_filter_median_points = QSpinBox()
+        self.force_filter_median_points.setRange(1, 9)
+        self.force_filter_median_points.setSingleStep(2)
+        self.force_filter_median_points.setValue(5)
+        self.force_filter_reset_btn = QPushButton("重置滤波")
+        self.force_filter_reset_btn.clicked.connect(self.reset_force_filter)
         self.control_style = QComboBox()
         self.control_style.addItem("保守", "conservative")
         self.control_style.addItem("标准", "standard")
         self.control_style.addItem("快速", "fast")
 
-        grid.addWidget(QLabel("δX/δY/δZ mm"), 0, 0)
+        grid.addWidget(QLabel("Mini45上位机滤波"), 0, 0)
+        grid.addWidget(self.force_filter_enabled, 0, 1)
+        grid.addWidget(QLabel("截止Hz"), 0, 2)
+        grid.addWidget(self.force_filter_cutoff_hz, 0, 3)
+        grid.addWidget(QLabel("中值点数"), 1, 0)
+        grid.addWidget(self.force_filter_median_points, 1, 1)
+        grid.addWidget(self.force_filter_reset_btn, 1, 2, 1, 2)
+
+        grid.addWidget(QLabel("δX/δY/δZ mm"), 2, 0)
         delta_row = QHBoxLayout()
         delta_row.addWidget(self.k_delta_x)
         delta_row.addWidget(self.k_delta_y)
         delta_row.addWidget(self.k_delta_z)
-        grid.addLayout(delta_row, 0, 1, 1, 3)
-        grid.addWidget(QLabel("等待/采样 s"), 1, 0)
+        grid.addLayout(delta_row, 2, 1, 1, 3)
+        grid.addWidget(QLabel("等待/采样 s"), 3, 0)
         wait_row = QHBoxLayout()
         wait_row.addWidget(self.k_wait_s)
         wait_row.addWidget(self.k_sample_s)
-        grid.addLayout(wait_row, 1, 1)
-        grid.addWidget(QLabel("条件数上限"), 1, 2)
-        grid.addWidget(self.k_condition_limit, 1, 3)
-        grid.addWidget(QLabel("最大单步 mm"), 2, 0)
-        grid.addWidget(self.auto_step_mm, 2, 1)
-        grid.addWidget(QLabel("控制间隔 s"), 2, 2)
-        grid.addWidget(self.auto_interval_s, 2, 3)
-        grid.addWidget(QLabel("速度 mm/s"), 3, 0)
-        grid.addWidget(self.auto_speed_mm_s, 3, 1)
-        grid.addWidget(QLabel("控制风格"), 3, 2)
-        grid.addWidget(self.control_style, 3, 3)
+        grid.addLayout(wait_row, 3, 1)
+        grid.addWidget(QLabel("条件数上限"), 3, 2)
+        grid.addWidget(self.k_condition_limit, 3, 3)
+        grid.addWidget(QLabel("最大单步 mm"), 4, 0)
+        grid.addWidget(self.auto_step_mm, 4, 1)
+        grid.addWidget(QLabel("控制间隔 s"), 4, 2)
+        grid.addWidget(self.auto_interval_s, 4, 3)
+        grid.addWidget(QLabel("速度 mm/s"), 5, 0)
+        grid.addWidget(self.auto_speed_mm_s, 5, 1)
+        grid.addWidget(QLabel("控制风格"), 5, 2)
+        grid.addWidget(self.control_style, 5, 3)
 
         k_buttons = QHBoxLayout()
         self.k_ident_btn = QPushButton("自动辨识 K")
@@ -404,10 +425,10 @@ class MainWindow(QMainWindow):
         self.k_clear_btn.clicked.connect(self.clear_force_control_k)
         k_buttons.addWidget(self.k_ident_btn)
         k_buttons.addWidget(self.k_clear_btn)
-        grid.addLayout(k_buttons, 4, 0, 1, 4)
+        grid.addLayout(k_buttons, 6, 0, 1, 4)
 
         self.k_status = QLabel("K 状态：未辨识")
-        grid.addWidget(self.k_status, 5, 0, 1, 4)
+        grid.addWidget(self.k_status, 7, 0, 1, 4)
         return box
 
     def _build_calibration_group(self) -> QGroupBox:
@@ -693,6 +714,8 @@ class MainWindow(QMainWindow):
             self.mini45.stop()
             self.mini45 = None
             self.last_force_time = 0.0
+            self.latest_force_sample = None
+            self.reset_force_filter(log=False)
             self.mini_btn.setText("连接 Mini45")
             self.mini_status.setText("Mini45 状态：未连接")
             self._log("Mini45 已断开")
@@ -709,6 +732,8 @@ class MainWindow(QMainWindow):
                     torque_counts_per_unit=self.torque_scale.value(),
             )
             self.last_force_time = 0.0
+            self.latest_force_sample = None
+            self.reset_force_filter(log=False)
             self.mini45.start()
             self.mini_btn.setText("断开 Mini45")
             if mini_mode == "simulator":
@@ -750,9 +775,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Mini45", f"读取 NETBA 系数失败：{exc}")
 
     def bias_mini45(self) -> None:
+        if self.auto_force_active or self.k_ident_active or self.zero_drift_active or self.training_active:
+            QMessageBox.warning(self, "Mini45", "自动标定、K 辨识、零点漂移或训练采集过程中不能清零/偏置")
+            return
         if self.mini45 and hasattr(self.mini45, "bias"):
             self.mini45.bias()
-            self._log("Mini45 清零/偏置命令已发送")
+            self.reset_force_filter(log=False)
+            self.buffer.clear()
+            self._clear_force_plot()
+            self._log("Mini45 清零/偏置命令已发送，已重置上位机滤波、稳定窗口和力曲线")
+
+    def _force_filter_settings(self) -> ForceFilterSettings:
+        return ForceFilterSettings(
+            enabled=self.force_filter_enabled.isChecked(),
+            cutoff_hz=self.force_filter_cutoff_hz.value(),
+            median_window=self.force_filter_median_points.value(),
+        )
+
+    def reset_force_filter(self, log: bool = True) -> None:
+        self.force_filter.reset()
+        if log:
+            self._log("Mini45 上位机滤波状态已重置")
+
+    def _clear_force_plot(self) -> None:
+        self.force_x.clear()
+        for values in self.force_y.values():
+            values.clear()
+        for curve in self.force_curves.values():
+            curve.setData([], [])
 
     def toggle_motion(self) -> None:
         if self.motion:
@@ -1566,23 +1616,26 @@ class MainWindow(QMainWindow):
                     self.force_frame_status.setText(f"坐标映射无效：{exc}")
                     self.force_frame_status.setStyleSheet("color: red")
                     continue
-                self.last_force_time = mapped_item.monotonic_s
-                self.latest_force_sample = mapped_item
+                filtered_item = self.force_filter.update(mapped_item, self._force_filter_settings())
+                self.last_force_time = filtered_item.monotonic_s
+                self.latest_force_sample = filtered_item
                 if first_sample:
                     self.mini_status.setText("Mini45 状态：数据正常")
                     self._log("Mini45 已收到第一帧可解析数据")
-                snapshot = CombinedSnapshot.from_force(mapped_item, raw_sample=item)
-                self.buffer.append(snapshot)
+                # 控制和稳定判定使用滤波后的传感器坐标力；CSV 原始时序仍写入未滤波数据。
+                control_snapshot = CombinedSnapshot.from_force(filtered_item, raw_sample=item)
+                raw_snapshot = CombinedSnapshot.from_force(mapped_item, raw_sample=item)
+                self.buffer.append(control_snapshot)
                 if self.recorder:
                     if self.training_active:
-                        self.recorder.write_training_raw(snapshot)
+                        self.recorder.write_training_raw(raw_snapshot)
                     else:
-                        self.recorder.write_raw(snapshot)
+                        self.recorder.write_raw(raw_snapshot)
                     if self.zero_drift_active:
-                        self.recorder.write_zero_drift_raw(snapshot)
+                        self.recorder.write_zero_drift_raw(raw_snapshot)
                 if self.zero_drift_active:
-                    self.zero_drift_samples.append(snapshot)
-                self._add_force_plot(mapped_item)
+                    self.zero_drift_samples.append(raw_snapshot)
+                self._add_force_plot(filtered_item)
 
     def _drain_motion(self) -> None:
         if not self.motion:

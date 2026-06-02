@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -190,6 +191,9 @@ FORCE_FRAME_MAPPING_FIELDS = [
 ]
 
 class CsvRecorder:
+    FLUSH_INTERVAL_S = 1.0
+    FLUSH_ROW_INTERVAL = 1000
+
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.raw_file = None
@@ -212,6 +216,8 @@ class CsvRecorder:
         self.force_frame_mapping_writer: Optional[csv.DictWriter] = None
         self.zero_drift_index = 0
         self.active_zero_path: Optional[Path] = None
+        self._pending_flush_rows = 0
+        self._last_flush_s = time.monotonic()
 
     def start(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -239,9 +245,11 @@ class CsvRecorder:
         self.force_control_k_writer.writeheader()
         self.force_control_log_writer.writeheader()
         self.force_frame_mapping_writer.writeheader()
+        self.flush()
 
     def stop(self) -> None:
         self.stop_zero_drift_timeseries()
+        self.flush()
         for file_obj in (
             self.raw_file,
             self.marker_file,
@@ -260,14 +268,43 @@ class CsvRecorder:
         self.force_frame_mapping_file = None
         self.raw_writer = self.marker_writer = self.cal_writer = self.training_raw_writer = self.training_marker_writer = None
         self.force_control_k_writer = self.force_control_log_writer = self.force_frame_mapping_writer = None
+        self._pending_flush_rows = 0
+
+    def _open_files(self):
+        return (
+            self.raw_file,
+            self.marker_file,
+            self.cal_file,
+            self.zero_file,
+            self.training_raw_file,
+            self.training_marker_file,
+            self.force_control_k_file,
+            self.force_control_log_file,
+            self.force_frame_mapping_file,
+        )
+
+    def flush(self) -> None:
+        for file_obj in self._open_files():
+            if file_obj:
+                file_obj.flush()
+        self._pending_flush_rows = 0
+        self._last_flush_s = time.monotonic()
+
+    def _mark_dirty(self, *, force: bool = False) -> None:
+        if force:
+            self.flush()
+            return
+        self._pending_flush_rows += 1
+        now = time.monotonic()
+        if self._pending_flush_rows >= self.FLUSH_ROW_INTERVAL or now - self._last_flush_s >= self.FLUSH_INTERVAL_S:
+            self.flush()
 
     def write_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.raw_writer:
             return
         row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
         self.raw_writer.writerow(row)
-        if self.raw_file:
-            self.raw_file.flush()
+        self._mark_dirty()
 
     def write_marker(self, marker_id: int, meta: ExperimentMeta) -> None:
         if not self.marker_writer:
@@ -288,16 +325,14 @@ class CsvRecorder:
                 "note": meta.note,
             }
         )
-        if self.marker_file:
-            self.marker_file.flush()
+        self._mark_dirty(force=True)
 
     def write_calibration_point(self, point: CalibrationPoint) -> None:
         if not self.cal_writer:
             return
         row = {field: point.to_row().get(field, "") for field in CALIBRATION_FIELDS}
         self.cal_writer.writerow(row)
-        if self.cal_file:
-            self.cal_file.flush()
+        self._mark_dirty(force=True)
 
     def start_zero_drift_timeseries(self) -> Path:
         if self.zero_writer:
@@ -308,6 +343,7 @@ class CsvRecorder:
         self.zero_writer = csv.DictWriter(self.zero_file, fieldnames=RAW_FIELDS)
         self.zero_writer.writeheader()
         self.active_zero_path = path
+        self.flush()
         return path
 
     def write_zero_drift_raw(self, snapshot: CombinedSnapshot) -> None:
@@ -315,8 +351,7 @@ class CsvRecorder:
             return
         row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
         self.zero_writer.writerow(row)
-        if self.zero_file:
-            self.zero_file.flush()
+        self._mark_dirty()
 
     def stop_zero_drift_timeseries(self) -> None:
         if self.zero_file:
@@ -342,14 +377,14 @@ class CsvRecorder:
             self.training_raw_writer.writeheader()
         if not marker_exists:
             self.training_marker_writer.writeheader()
+        self.flush()
 
     def write_training_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.training_raw_writer:
             return
         row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
         self.training_raw_writer.writerow(row)
-        if self.training_raw_file:
-            self.training_raw_file.flush()
+        self._mark_dirty()
 
     def write_training_marker(
         self,
@@ -381,13 +416,14 @@ class CsvRecorder:
                 "note": meta.note,
             }
         )
-        if self.training_marker_file:
-            self.training_marker_file.flush()
+        self._mark_dirty(force=True)
 
     def stop_training_files(self) -> None:
         for file_obj in (self.training_raw_file, self.training_marker_file):
             if file_obj:
                 file_obj.flush()
+        self._pending_flush_rows = 0
+        self._last_flush_s = time.monotonic()
 
     def write_force_control_k(self, row: dict) -> None:
         if not self.force_control_k_writer:
@@ -395,8 +431,7 @@ class CsvRecorder:
         out = {field: row.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
         out["timestamp"] = out["timestamp"] or utc_timestamp()
         self.force_control_k_writer.writerow(out)
-        if self.force_control_k_file:
-            self.force_control_k_file.flush()
+        self._mark_dirty(force=True)
 
     def write_force_control_log(self, row: dict) -> None:
         if not self.force_control_log_writer:
@@ -404,8 +439,7 @@ class CsvRecorder:
         out = {field: row.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
         out["timestamp"] = out["timestamp"] or utc_timestamp()
         self.force_control_log_writer.writerow(out)
-        if self.force_control_log_file:
-            self.force_control_log_file.flush()
+        self._mark_dirty()
 
     def write_force_frame_mapping(self, row: dict) -> None:
         if not self.force_frame_mapping_writer:
@@ -413,8 +447,7 @@ class CsvRecorder:
         out = {field: row.get(field, "") for field in FORCE_FRAME_MAPPING_FIELDS}
         out["timestamp"] = out["timestamp"] or utc_timestamp()
         self.force_frame_mapping_writer.writerow(out)
-        if self.force_frame_mapping_file:
-            self.force_frame_mapping_file.flush()
+        self._mark_dirty(force=True)
 
     def __enter__(self) -> "CsvRecorder":
         self.start()

@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Mini45 + ESP32/MC1081 三维力标定上位机")
         self.resize(1280, 860)
 
-        self.buffer = SampleBuffer(max_seconds=600)
+        self.buffer = SampleBuffer(max_seconds=120)
         self.esp32 = None
         self.mini45 = None
         self.motion: ArduinoMotionAdapter | None = None
@@ -118,7 +118,7 @@ class MainWindow(QMainWindow):
         self.zero_drift_count = 0
         self.zero_drift_active = False
         self.zero_drift_start_s = 0.0
-        self.zero_drift_samples: list[CombinedSnapshot] = []
+        self.zero_drift_sample_count = 0
         self.zero_drift_file = ""
         self.training_count = 0
         self.training_active = False
@@ -144,6 +144,10 @@ class MainWindow(QMainWindow):
         self.force_y = {key: [] for key in ("fx", "fy", "fz")}
         self.cap_x: list[float] = []
         self.cap_y = {key: [] for key in ("c0", "c1", "c2", "c3", "c4")}
+        self.last_force_plot_update_s = 0.0
+        self.last_cap_plot_update_s = 0.0
+        self.max_mini45_items_per_tick = 500
+        self.max_esp32_items_per_tick = 200
 
         self._build_ui()
         self.timer = QTimer(self)
@@ -803,6 +807,7 @@ class MainWindow(QMainWindow):
             values.clear()
         for curve in self.force_curves.values():
             curve.setData([], [])
+        self.last_force_plot_update_s = 0.0
 
     def toggle_motion(self) -> None:
         if self.motion:
@@ -1429,7 +1434,7 @@ class MainWindow(QMainWindow):
         self.current_cycle_id = f"zero_{self.zero_drift_count:03d}"
         self.zero_drift_active = True
         self.zero_drift_start_s = time.monotonic()
-        self.zero_drift_samples = []
+        self.zero_drift_sample_count = 0
         path = self.recorder.start_zero_drift_timeseries() if self.recorder else None
         self.zero_drift_file = path.name if path else ""
         self._write_marker_with_note("zero_start")
@@ -1443,8 +1448,8 @@ class MainWindow(QMainWindow):
         self._write_marker_with_note("zero_end")
         if self.recorder:
             self.recorder.stop_zero_drift_timeseries()
-        self.cal_status.setText(f"标定状态：空载零点漂移{reason}，共 {len(self.zero_drift_samples)} 行")
-        self._log(f"空载零点漂移{reason}：{len(self.zero_drift_samples)} 行")
+        self.cal_status.setText(f"标定状态：空载零点漂移{reason}，共 {self.zero_drift_sample_count} 行")
+        self._log(f"空载零点漂移{reason}：{self.zero_drift_sample_count} 行")
 
     def _write_marker_with_note(self, note: str) -> None:
         self.marker_id += 1
@@ -1571,11 +1576,13 @@ class MainWindow(QMainWindow):
     def _drain_esp32(self) -> None:
         if not self.esp32:
             return
-        while True:
+        processed = 0
+        while processed < self.max_esp32_items_per_tick:
             try:
                 item = self.esp32.out_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if isinstance(item, Esp32Log):
                 self._log(f"ESP32 {self._display_level(item.level)}：{item.message}")
             elif isinstance(item, CapSample):
@@ -1585,22 +1592,24 @@ class MainWindow(QMainWindow):
                 if self.recorder:
                     if self.training_active:
                         self.recorder.write_training_raw(snapshot)
-                    else:
+                    elif self._static_raw_recording_active():
                         self.recorder.write_raw(snapshot)
                     if self.zero_drift_active:
                         self.recorder.write_zero_drift_raw(snapshot)
                 if self.zero_drift_active:
-                    self.zero_drift_samples.append(snapshot)
+                    self.zero_drift_sample_count += 1
                 self._add_cap_plot(item)
 
     def _drain_mini45(self) -> None:
         if not self.mini45:
             return
-        while True:
+        processed = 0
+        while processed < self.max_mini45_items_per_tick:
             try:
                 item = self.mini45.out_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if isinstance(item, Mini45Log):
                 self._log(f"Mini45 {self._display_level(item.level)}：{item.message}")
                 if item.level in {"warning", "error"}:
@@ -1629,13 +1638,21 @@ class MainWindow(QMainWindow):
                 if self.recorder:
                     if self.training_active:
                         self.recorder.write_training_raw(raw_snapshot)
-                    else:
+                    elif self._static_raw_recording_active():
                         self.recorder.write_raw(raw_snapshot)
                     if self.zero_drift_active:
                         self.recorder.write_zero_drift_raw(raw_snapshot)
                 if self.zero_drift_active:
-                    self.zero_drift_samples.append(raw_snapshot)
+                    self.zero_drift_sample_count += 1
                 self._add_force_plot(filtered_item)
+
+    def _static_raw_recording_active(self) -> bool:
+        return bool(
+            self.zero_drift_active
+            or self.auto_force_active
+            or self.auto_force_holding
+            or self.k_ident_active
+        )
 
     def _drain_motion(self) -> None:
         if not self.motion:
@@ -1880,6 +1897,9 @@ class MainWindow(QMainWindow):
         for key in self.force_y:
             self.force_y[key].append(getattr(sample, key))
         self._trim_plot(self.force_x, self.force_y)
+        if sample.monotonic_s - self.last_force_plot_update_s < 0.10:
+            return
+        self.last_force_plot_update_s = sample.monotonic_s
         for key, curve in self.force_curves.items():
             curve.setData(self.force_x, self.force_y[key])
         for label, attr in (("Fx", "fx"), ("Fy", "fy"), ("Fz", "fz"), ("Mx", "mx"), ("My", "my"), ("Mz", "mz")):
@@ -1891,6 +1911,9 @@ class MainWindow(QMainWindow):
         for key in self.cap_y:
             self.cap_y[key].append(getattr(sample, key))
         self._trim_plot(self.cap_x, self.cap_y)
+        if sample.monotonic_s - self.last_cap_plot_update_s < 0.10:
+            return
+        self.last_cap_plot_update_s = sample.monotonic_s
         for key, curve in self.cap_curves.items():
             curve.setData(self.cap_x, self.cap_y[key])
         for label, attr in (("C0", "c0"), ("C1", "c1"), ("C2", "c2"), ("C3", "c3"), ("C4", "c4")):

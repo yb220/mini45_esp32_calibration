@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         self.cap_y = {key: [] for key in ("c0", "c1", "c2", "c3", "c4")}
         self.last_force_plot_update_s = 0.0
         self.last_cap_plot_update_s = 0.0
+        self.last_cal_progress_update_s = 0.0
         self.max_mini45_items_per_tick = 500
         self.max_esp32_items_per_tick = 200
 
@@ -663,7 +664,8 @@ class MainWindow(QMainWindow):
             widget.setVisible(is_sequence and shear_axis)
         self.cal_pause_btn.setVisible(is_single or is_sequence or is_combined)
         self.cal_resume_btn.setVisible(is_single or is_sequence or is_combined)
-        self.cal_skip_btn.setVisible(is_sequence)
+        self.cal_skip_btn.setVisible(is_sequence or is_combined)
+        self._update_calibration_buttons()
 
     def refresh_ports(self) -> None:
         current_esp = self.esp_port.currentText() if hasattr(self, "esp_port") else ""
@@ -687,6 +689,30 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_dir.text())
         if path:
             self.output_dir.setText(path)
+
+    def _calibration_active(self) -> bool:
+        return bool(
+            self.zero_drift_active
+            or self.training_active
+            or self.auto_force_active
+            or self.auto_force_holding
+        )
+
+    def _plot_updates_suspended(self) -> bool:
+        # 子实验运行时优先保证采集、保存和力控，不重绘曲线。
+        return self._calibration_active() or self.k_ident_active
+
+    def _update_calibration_buttons(self) -> None:
+        if not hasattr(self, "cal_start_btn"):
+            return
+        active = self._calibration_active()
+        paused = self.calibration_paused and active
+        self.cal_start_btn.setEnabled(not active and not self.k_ident_active)
+        self.cal_start_btn.setText("标定运行中" if active else "开始标定")
+        self.cal_pause_btn.setEnabled(active and not paused and not self.zero_drift_active)
+        self.cal_resume_btn.setEnabled(active and paused)
+        self.cal_stop_btn.setEnabled(active)
+        self.cal_skip_btn.setEnabled(active and (self.training_active or self.calibration_mode == "sequence"))
 
     def toggle_esp32(self) -> None:
         if self.esp32:
@@ -998,6 +1024,7 @@ class MainWindow(QMainWindow):
         self.k_status.setText("K 状态：正在辨识 X 轴扰动前均值")
         self.cal_status.setText("标定状态：K 自动辨识中")
         self._log("开始自动辨识 K：列顺序固定为 Arduino X/Y/Z，行顺序为传感器坐标 Fx/Fy/Fz")
+        self._update_calibration_buttons()
 
     def clear_force_control_k(self) -> None:
         self.force_control_result = None
@@ -1019,6 +1046,7 @@ class MainWindow(QMainWindow):
         self.cal_status.setText(f"标定状态：K 辨识失败，{reason}")
         self._log(f"K 辨识失败：{reason}")
         self._update_force_frame_mapping_lock()
+        self._update_calibration_buttons()
 
     def _force_sample_window(self, seconds: float):
         return force_stats(self.buffer.window(time.monotonic(), seconds))
@@ -1137,6 +1165,7 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"K 辨识无效：{result.reject_reason}")
             QMessageBox.warning(self, "K 辨识", f"K 辨识无效：{result.reject_reason}")
+        self._update_calibration_buttons()
 
     def update_k_display(self, result=None) -> None:
         result = result or self.force_control_result
@@ -1186,6 +1215,9 @@ class MainWindow(QMainWindow):
 
     def start_calibration(self) -> None:
         mode = self._combo_value(self.experiment_mode)
+        if self._calibration_active() or self.k_ident_active:
+            QMessageBox.information(self, "标定状态", "当前已有子实验正在运行，请先停止或等待完成")
+            return
         if not self.ensure_recording():
             return
         if mode == "combined" and not self._training_devices_ready():
@@ -1196,6 +1228,7 @@ class MainWindow(QMainWindow):
         self.active_target = None
         self.calibration_paused = False
         self.calibration_mode = mode
+        self._update_calibration_buttons()
         if mode == "zero":
             self.start_zero_drift()
             return
@@ -1209,7 +1242,8 @@ class MainWindow(QMainWindow):
                 target_fy=self.target_fy.value(),
                 target_fz=self.target_fz.value(),
             )
-            self.start_auto_force()
+            if not self.start_auto_force():
+                self.stop_calibration("启动失败")
             return
         if mode == "sequence":
             self.sequence_targets = self._build_sequence_targets()
@@ -1254,7 +1288,8 @@ class MainWindow(QMainWindow):
         self.active_target = self.sequence_targets[self.sequence_index]
         self._apply_target_to_ui(self.active_target)
         self.cal_status.setText(f"标定状态：正反程点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
-        self.start_auto_force()
+        if not self.start_auto_force():
+            self.stop_calibration("启动失败")
 
     def _apply_target_to_ui(self, target: CalibrationTarget) -> None:
         self._set_combo_by_data(self.load_axis, target.axis)
@@ -1293,8 +1328,10 @@ class MainWindow(QMainWindow):
         self.start_auto_force()
         if not self.auto_force_active:
             self.finish_training_collection("启动失败")
+            self._update_calibration_buttons()
             return
         self._log("训练数据采集开始：仅写入 training_raw_timeseries.csv 和 training_markers.csv")
+        self._update_calibration_buttons()
 
     def _enter_training_target(self, index: int) -> None:
         self.training_target_index = index
@@ -1383,6 +1420,8 @@ class MainWindow(QMainWindow):
         )
 
     def pause_calibration(self) -> None:
+        if not self._calibration_active():
+            return
         self.calibration_paused = True
         if self.training_active:
             self.training_pause_started_s = time.monotonic()
@@ -1392,6 +1431,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.cal_status.setText("标定状态：已暂停")
+        self._update_calibration_buttons()
 
     def resume_calibration(self) -> None:
         if not self.calibration_mode:
@@ -1401,11 +1441,13 @@ class MainWindow(QMainWindow):
             self.training_pause_started_s = 0.0
         self.calibration_paused = False
         self.cal_status.setText("标定状态：继续")
+        self._update_calibration_buttons()
 
     def skip_calibration_point(self) -> None:
         if self.training_active:
             self._write_training_marker("target_skipped")
             self._advance_training_target()
+            self._update_calibration_buttons()
             return
         if self.calibration_mode == "sequence":
             self.sequence_index += 1
@@ -1427,6 +1469,7 @@ class MainWindow(QMainWindow):
         self.training_current_target = None
         if reason:
             self.cal_status.setText(f"标定状态：{reason}")
+        self._update_calibration_buttons()
 
     def start_zero_drift(self) -> None:
         self.stop_auto_force("零点漂移采集中")
@@ -1440,6 +1483,7 @@ class MainWindow(QMainWindow):
         self._write_marker_with_note("zero_start")
         self.cal_status.setText(f"标定状态：空载零点漂移采集中，文件 {self.zero_drift_file}")
         self._log(f"空载零点漂移开始：{self.zero_drift_file}")
+        self._update_calibration_buttons()
 
     def finish_zero_drift(self, reason: str = "完成") -> None:
         if not self.zero_drift_active:
@@ -1450,6 +1494,9 @@ class MainWindow(QMainWindow):
             self.recorder.stop_zero_drift_timeseries()
         self.cal_status.setText(f"标定状态：空载零点漂移{reason}，共 {self.zero_drift_sample_count} 行")
         self._log(f"空载零点漂移{reason}：{self.zero_drift_sample_count} 行")
+        if self.calibration_mode == "zero":
+            self.calibration_mode = ""
+        self._update_calibration_buttons()
 
     def _write_marker_with_note(self, note: str) -> None:
         self.marker_id += 1
@@ -1458,19 +1505,19 @@ class MainWindow(QMainWindow):
         if self.recorder:
             self.recorder.write_marker(self.marker_id, meta)
 
-    def start_auto_force(self) -> None:
+    def start_auto_force(self) -> bool:
         if not self.motion:
             QMessageBox.warning(self, "自动标定", "请先连接 Arduino 电机控制串口")
-            return
+            return False
         if not self.mini45:
             QMessageBox.warning(self, "自动标定", "请先连接 Mini45 并确认有实时力数据")
-            return
+            return False
         if self.k_ident_active:
             QMessageBox.warning(self, "自动标定", "K 正在自动辨识，请等待辨识结束")
-            return
+            return False
         if not self.force_control_result or not self.force_control_result.valid:
             QMessageBox.warning(self, "自动标定", "请先完成有效的 K 自动辨识")
-            return
+            return False
         self.auto_force_active = True
         self.auto_force_holding = False
         self.auto_force_marker_done = False
@@ -1484,11 +1531,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.auto_force_active = False
             QMessageBox.warning(self, "自动标定", str(exc))
-            return
+            return False
         meta = self._meta()
         self.motion_status.setText(f"电机状态：自动逼近 {meta.axis}")
         self.cal_status.setText(f"标定状态：自动逼近目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}")
         self._log(f"开始解耦自动力控，目标 Fx={meta.target_fx:.3f}, Fy={meta.target_fy:.3f}, Fz={meta.target_fz:.3f}")
+        self._update_calibration_buttons()
+        return True
 
     def stop_auto_force(self, reason: str = "") -> None:
         if not self.auto_force_active and not self.auto_force_holding:
@@ -1505,6 +1554,7 @@ class MainWindow(QMainWindow):
         if reason:
             self.motion_status.setText(f"电机状态：自动停止，{reason}")
             self._log(f"自动逼近停止：{reason}")
+        self._update_calibration_buttons()
 
     def toggle_recording(self) -> None:
         if self.recorder:
@@ -1569,9 +1619,24 @@ class MainWindow(QMainWindow):
         self._update_k_identification()
         if self.zero_drift_active and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
             self.finish_zero_drift("完成")
+        self._update_calibration_progress_status()
         self._update_training_collection()
         self._update_auto_force()
         self._update_status()
+
+    def _update_calibration_progress_status(self) -> None:
+        now = time.monotonic()
+        if now - self.last_cal_progress_update_s < 0.5:
+            return
+        self.last_cal_progress_update_s = now
+        if self.zero_drift_active:
+            elapsed = max(0.0, now - self.zero_drift_start_s)
+            total = self.zero_duration_s.value()
+            remaining = max(0.0, total - elapsed)
+            self.cal_status.setText(
+                f"标定状态：空载零点漂移进行中，已采集 {elapsed:.1f}/{total:.1f}s，"
+                f"剩余 {remaining:.1f}s，已保存 {self.zero_drift_sample_count} 行"
+            )
 
     def _drain_esp32(self) -> None:
         if not self.esp32:
@@ -1892,6 +1957,11 @@ class MainWindow(QMainWindow):
         )
 
     def _add_force_plot(self, sample: ForceSample) -> None:
+        if self._plot_updates_suspended():
+            if sample.monotonic_s - self.last_force_plot_update_s >= 0.25:
+                self.last_force_plot_update_s = sample.monotonic_s
+                self._update_force_value_labels(sample)
+            return
         x = sample.monotonic_s
         self.force_x.append(x)
         for key in self.force_y:
@@ -1902,10 +1972,18 @@ class MainWindow(QMainWindow):
         self.last_force_plot_update_s = sample.monotonic_s
         for key, curve in self.force_curves.items():
             curve.setData(self.force_x, self.force_y[key])
+        self._update_force_value_labels(sample)
+
+    def _update_force_value_labels(self, sample: ForceSample) -> None:
         for label, attr in (("Fx", "fx"), ("Fy", "fy"), ("Fz", "fz"), ("Mx", "mx"), ("My", "my"), ("Mz", "mz")):
             self.value_labels[label].setText(f"{getattr(sample, attr):.4f}")
 
     def _add_cap_plot(self, sample: CapSample) -> None:
+        if self._plot_updates_suspended():
+            if sample.monotonic_s - self.last_cap_plot_update_s >= 0.25:
+                self.last_cap_plot_update_s = sample.monotonic_s
+                self._update_cap_value_labels(sample)
+            return
         x = sample.monotonic_s
         self.cap_x.append(x)
         for key in self.cap_y:
@@ -1916,6 +1994,9 @@ class MainWindow(QMainWindow):
         self.last_cap_plot_update_s = sample.monotonic_s
         for key, curve in self.cap_curves.items():
             curve.setData(self.cap_x, self.cap_y[key])
+        self._update_cap_value_labels(sample)
+
+    def _update_cap_value_labels(self, sample: CapSample) -> None:
         for label, attr in (("C0", "c0"), ("C1", "c1"), ("C2", "c2"), ("C3", "c3"), ("C4", "c4")):
             self.value_labels[label].setText(f"{getattr(sample, attr):.6f}")
 

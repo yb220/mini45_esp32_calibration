@@ -108,7 +108,7 @@ class Mini45NetFTAdapter:
         self.torque_counts_per_unit = torque_counts_per_unit
         self.force_signs = list(force_signs)
         self.torque_signs = list(torque_signs)
-        self.out_queue: queue.Queue[ForceSample | Mini45Log] = queue.Queue()
+        self.out_queue: queue.Queue[ForceSample | Mini45Log] = queue.Queue(maxsize=5000)
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -118,6 +118,21 @@ class Mini45NetFTAdapter:
         self._last_packet_time = 0.0
         self._last_sequence: int | None = None
         self._last_status: int | None = None
+        self._sequence_gap_count = 0
+        self._last_sequence_warning_s = 0.0
+
+    def _put_output(self, item: ForceSample | Mini45Log) -> None:
+        try:
+            self.out_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.out_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.out_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def start(self) -> None:
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -130,7 +145,9 @@ class Mini45NetFTAdapter:
         self._last_packet_time = 0.0
         self._last_sequence = None
         self._last_status = None
-        self.out_queue.put(
+        self._sequence_gap_count = 0
+        self._last_sequence_warning_s = 0.0
+        self._put_output(
             Mini45Log(
                 "info",
                 f"已向 {self.ip}:{self.port} 发送 RDT 启动命令，本机接收端口 {local_ip}:{local_port}，等待第一帧 UDP 数据",
@@ -143,7 +160,7 @@ class Mini45NetFTAdapter:
     def bias(self) -> None:
         if self._socket:
             self._socket.sendto(build_rdt_command(CMD_BIAS, 0), (self.ip, self.port))
-            self.out_queue.put(Mini45Log("info", "已发送 RDT 软件清零/偏置命令"))
+            self._put_output(Mini45Log("info", "已发送 RDT 软件清零/偏置命令"))
 
     def stop(self) -> None:
         self._stop.set()
@@ -167,7 +184,7 @@ class Mini45NetFTAdapter:
                 self._last_packet_time = now
                 if not self._first_packet_seen:
                     self._first_packet_seen = True
-                    self.out_queue.put(Mini45Log("info", f"已收到第一帧 RDT UDP 数据，包长 {len(data)} 字节，来源 {_addr[0]}:{_addr[1]}"))
+                    self._put_output(Mini45Log("info", f"已收到第一帧 RDT UDP 数据，包长 {len(data)} 字节，来源 {_addr[0]}:{_addr[1]}"))
                 samples = parse_rdt_packet(
                     data,
                     monotonic_s=now,
@@ -177,23 +194,32 @@ class Mini45NetFTAdapter:
                     torque_signs=self.torque_signs,
                 )
                 if not samples:
-                    self.out_queue.put(Mini45Log("error", f"RDT 数据包长度异常：{len(data)} 字节，应为 36 字节的整数倍"))
+                    self._put_output(Mini45Log("error", f"RDT 数据包长度异常：{len(data)} 字节，应为 36 字节的整数倍"))
                 for sample in samples:
                     if self._last_sequence is not None and sample.sequence is not None:
                         expected = (self._last_sequence + 1) & 0xFFFFFFFF
                         if sample.sequence != expected:
-                            self.out_queue.put(Mini45Log("warning", f"RDT 序号不连续：期望 {expected}，收到 {sample.sequence}"))
+                            self._sequence_gap_count += 1
+                            if now - self._last_sequence_warning_s >= 1.0:
+                                self._last_sequence_warning_s = now
+                                self._put_output(
+                                    Mini45Log(
+                                        "warning",
+                                        f"RDT 序号不连续：期望 {expected}，收到 {sample.sequence}，近 1 秒累计 {self._sequence_gap_count} 次",
+                                    )
+                                )
+                                self._sequence_gap_count = 0
                     if sample.sequence is not None:
                         self._last_sequence = sample.sequence
                     if sample.status and sample.status != self._last_status:
-                        self.out_queue.put(Mini45Log("warning", f"Mini45 系统状态码非零：0x{sample.status:08X}"))
+                        self._put_output(Mini45Log("warning", f"Mini45 系统状态码非零：0x{sample.status:08X}"))
                     self._last_status = sample.status
-                    self.out_queue.put(sample)
+                    self._put_output(sample)
             except socket.timeout:
                 now = time.monotonic()
                 if not self._first_packet_seen and now - self._started_at > 2.0 and now - self._last_timeout_log > 2.0:
                     self._last_timeout_log = now
-                    self.out_queue.put(
+                    self._put_output(
                         Mini45Log(
                             "warning",
                             "发送 RDT 启动命令后仍未收到 UDP 数据。请检查 NETBA IP、电脑网卡同网段、防火墙、RDT 是否启用，以及是否有其他客户端占用了 RDT",
@@ -201,21 +227,34 @@ class Mini45NetFTAdapter:
                     )
                 elif self._first_packet_seen and now - self._last_packet_time > 1.0 and now - self._last_timeout_log > 2.0:
                     self._last_timeout_log = now
-                    self.out_queue.put(Mini45Log("warning", "Mini45 UDP 数据超过 1 秒未更新"))
+                    self._put_output(Mini45Log("warning", "Mini45 UDP 数据超过 1 秒未更新"))
                 continue
             except Exception as exc:
-                self.out_queue.put(Mini45Log("error", f"Net F/T 通信错误：{exc}"))
+                self._put_output(Mini45Log("error", f"Net F/T 通信错误：{exc}"))
                 time.sleep(0.2)
 
 
 class Mini45Simulator:
     def __init__(self, rate_hz: int = 100):
         self.rate_hz = rate_hz
-        self.out_queue: queue.Queue[ForceSample | Mini45Log] = queue.Queue()
+        self.out_queue: queue.Queue[ForceSample | Mini45Log] = queue.Queue(maxsize=1000)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._start = time.monotonic()
         self._sequence = 0
+
+    def _put_output(self, item: ForceSample | Mini45Log) -> None:
+        try:
+            self.out_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.out_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.out_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def start(self) -> None:
         self._stop.clear()
@@ -238,7 +277,7 @@ class Mini45Simulator:
             fx = 0.2 * math.sin(t * 0.7)
             fy = 0.15 * math.sin(t * 0.5)
             fz = 1.0 + 0.4 * math.sin(t * 0.3)
-            self.out_queue.put(
+            self._put_output(
                 ForceSample(
                     timestamp=utc_timestamp(),
                     monotonic_s=time.monotonic(),

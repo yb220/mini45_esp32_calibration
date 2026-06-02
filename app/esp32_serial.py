@@ -65,10 +65,23 @@ class Esp32SerialAdapter:
         self.baud = baud
         self.mode = mode
         self.rate_hz = rate_hz
-        self.out_queue: queue.Queue[CapSample | Esp32Log] = queue.Queue()
+        self.out_queue: queue.Queue[CapSample | Esp32Log] = queue.Queue(maxsize=2000)
         self._serial = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+
+    def _put_output(self, item: CapSample | Esp32Log) -> None:
+        try:
+            self.out_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.out_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.out_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def start(self) -> None:
         self._serial = serial.Serial(self.port, self.baud, timeout=0.2)
@@ -108,7 +121,7 @@ class Esp32SerialAdapter:
                 line = raw.decode("utf-8", errors="replace").strip()
                 parsed = parse_cap_line(line)
                 if parsed is not None:
-                    self.out_queue.put(parsed)
+                    self._put_output(parsed)
             except Exception as exc:
-                self.out_queue.put(Esp32Log("error", f"Serial error: {exc}"))
+                self._put_output(Esp32Log("error", f"Serial error: {exc}"))
                 time.sleep(0.2)

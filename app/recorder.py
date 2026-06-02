@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import csv
+import queue
+import threading
 import time
-from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .models import CalibrationPoint, CombinedSnapshot, ExperimentMeta, utc_timestamp
 
@@ -218,8 +219,13 @@ class CsvRecorder:
         self.active_zero_path: Optional[Path] = None
         self._pending_flush_rows = 0
         self._last_flush_s = time.monotonic()
+        self._write_queue: queue.Queue[tuple[str, Any] | None] = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._worker_error: Exception | None = None
 
     def start(self) -> None:
+        self._write_queue = queue.Queue()
+        self._worker_error = None
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.raw_file = (self.output_dir / "raw_timeseries.csv").open("w", newline="", encoding="utf-8-sig")
         self.marker_file = (self.output_dir / "markers.csv").open("w", newline="", encoding="utf-8-sig")
@@ -246,9 +252,16 @@ class CsvRecorder:
         self.force_control_log_writer.writeheader()
         self.force_frame_mapping_writer.writeheader()
         self.flush()
+        self._worker = threading.Thread(target=self._writer_loop, name="csv-recorder-writer", daemon=True)
+        self._worker.start()
 
     def stop(self) -> None:
         self.stop_zero_drift_timeseries()
+        self._wait_for_writes()
+        if self._worker:
+            self._write_queue.put(None)
+            self._worker.join(timeout=5.0)
+            self._worker = None
         self.flush()
         for file_obj in (
             self.raw_file,
@@ -284,32 +297,100 @@ class CsvRecorder:
         )
 
     def flush(self) -> None:
+        self._wait_for_writes()
+        self._flush_files()
+
+    def _flush_files(self) -> None:
         for file_obj in self._open_files():
             if file_obj:
                 file_obj.flush()
         self._pending_flush_rows = 0
         self._last_flush_s = time.monotonic()
 
+    def _wait_for_writes(self) -> None:
+        if self._worker and threading.current_thread() is not self._worker:
+            self._write_queue.join()
+
     def _mark_dirty(self, *, force: bool = False) -> None:
         if force:
-            self.flush()
+            self._flush_files()
             return
         self._pending_flush_rows += 1
         now = time.monotonic()
         if self._pending_flush_rows >= self.FLUSH_ROW_INTERVAL or now - self._last_flush_s >= self.FLUSH_INTERVAL_S:
-            self.flush()
+            self._flush_files()
+
+    def _enqueue(self, kind: str, payload: Any) -> None:
+        if self._worker_error is not None:
+            return
+        if not self._worker:
+            self._write_task(kind, payload)
+            return
+        self._write_queue.put((kind, payload))
+
+    def _writer_loop(self) -> None:
+        while True:
+            task = self._write_queue.get()
+            try:
+                if task is None:
+                    return
+                kind, payload = task
+                self._write_task(kind, payload)
+            except Exception as exc:  # pragma: no cover - defensive for runtime I/O errors
+                self._worker_error = exc
+            finally:
+                self._write_queue.task_done()
+
+    def _snapshot_row(self, snapshot: CombinedSnapshot) -> dict:
+        source = snapshot.to_row()
+        return {field: source.get(field, "") for field in RAW_FIELDS}
+
+    def _write_task(self, kind: str, payload: Any) -> None:
+        if kind == "raw" and self.raw_writer:
+            self.raw_writer.writerow(self._snapshot_row(payload))
+            self._mark_dirty()
+        elif kind == "zero" and self.zero_writer:
+            self.zero_writer.writerow(self._snapshot_row(payload))
+            self._mark_dirty()
+        elif kind == "training_raw" and self.training_raw_writer:
+            self.training_raw_writer.writerow(self._snapshot_row(payload))
+            self._mark_dirty()
+        elif kind == "marker" and self.marker_writer:
+            self.marker_writer.writerow(payload)
+            self._mark_dirty(force=True)
+        elif kind == "calibration" and self.cal_writer:
+            row = {field: payload.to_row().get(field, "") for field in CALIBRATION_FIELDS}
+            self.cal_writer.writerow(row)
+            self._mark_dirty(force=True)
+        elif kind == "training_marker" and self.training_marker_writer:
+            self.training_marker_writer.writerow(payload)
+            self._mark_dirty(force=True)
+        elif kind == "force_control_k" and self.force_control_k_writer:
+            out = {field: payload.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
+            out["timestamp"] = out["timestamp"] or utc_timestamp()
+            self.force_control_k_writer.writerow(out)
+            self._mark_dirty(force=True)
+        elif kind == "force_control_log" and self.force_control_log_writer:
+            out = {field: payload.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
+            out["timestamp"] = out["timestamp"] or utc_timestamp()
+            self.force_control_log_writer.writerow(out)
+            self._mark_dirty()
+        elif kind == "force_frame_mapping" and self.force_frame_mapping_writer:
+            out = {field: payload.get(field, "") for field in FORCE_FRAME_MAPPING_FIELDS}
+            out["timestamp"] = out["timestamp"] or utc_timestamp()
+            self.force_frame_mapping_writer.writerow(out)
+            self._mark_dirty(force=True)
 
     def write_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.raw_writer:
             return
-        row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
-        self.raw_writer.writerow(row)
-        self._mark_dirty()
+        self._enqueue("raw", snapshot)
 
     def write_marker(self, marker_id: int, meta: ExperimentMeta) -> None:
         if not self.marker_writer:
             return
-        self.marker_writer.writerow(
+        self._enqueue(
+            "marker",
             {
                 "timestamp": utc_timestamp(),
                 "marker_id": marker_id,
@@ -323,37 +404,34 @@ class CsvRecorder:
                 "target_Fy": meta.target_fy,
                 "target_Fz": meta.target_fz,
                 "note": meta.note,
-            }
+            },
         )
-        self._mark_dirty(force=True)
 
     def write_calibration_point(self, point: CalibrationPoint) -> None:
         if not self.cal_writer:
             return
-        row = {field: point.to_row().get(field, "") for field in CALIBRATION_FIELDS}
-        self.cal_writer.writerow(row)
-        self._mark_dirty(force=True)
+        self._enqueue("calibration", point)
 
     def start_zero_drift_timeseries(self) -> Path:
         if self.zero_writer:
             self.stop_zero_drift_timeseries()
+        self._wait_for_writes()
         self.zero_drift_index += 1
         path = self.output_dir / f"zero_drift_timeseries_{self.zero_drift_index:03d}.csv"
         self.zero_file = path.open("w", newline="", encoding="utf-8-sig")
         self.zero_writer = csv.DictWriter(self.zero_file, fieldnames=RAW_FIELDS)
         self.zero_writer.writeheader()
         self.active_zero_path = path
-        self.flush()
+        self._flush_files()
         return path
 
     def write_zero_drift_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.zero_writer:
             return
-        row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
-        self.zero_writer.writerow(row)
-        self._mark_dirty()
+        self._enqueue("zero", snapshot)
 
     def stop_zero_drift_timeseries(self) -> None:
+        self._wait_for_writes()
         if self.zero_file:
             self.zero_file.flush()
             self.zero_file.close()
@@ -377,14 +455,13 @@ class CsvRecorder:
             self.training_raw_writer.writeheader()
         if not marker_exists:
             self.training_marker_writer.writeheader()
-        self.flush()
+        self._wait_for_writes()
+        self._flush_files()
 
     def write_training_raw(self, snapshot: CombinedSnapshot) -> None:
         if not self.training_raw_writer:
             return
-        row = {field: snapshot.to_row().get(field, "") for field in RAW_FIELDS}
-        self.training_raw_writer.writerow(row)
-        self._mark_dirty()
+        self._enqueue("training_raw", snapshot)
 
     def write_training_marker(
         self,
@@ -397,7 +474,8 @@ class CsvRecorder:
     ) -> None:
         if not self.training_marker_writer:
             return
-        self.training_marker_writer.writerow(
+        self._enqueue(
+            "training_marker",
             {
                 "timestamp": utc_timestamp(),
                 "marker_id": marker_id,
@@ -414,11 +492,11 @@ class CsvRecorder:
                 "target_shear_N": target_shear_n,
                 "target_angle_deg": target_angle_deg,
                 "note": meta.note,
-            }
+            },
         )
-        self._mark_dirty(force=True)
 
     def stop_training_files(self) -> None:
+        self._wait_for_writes()
         for file_obj in (self.training_raw_file, self.training_marker_file):
             if file_obj:
                 file_obj.flush()
@@ -428,26 +506,17 @@ class CsvRecorder:
     def write_force_control_k(self, row: dict) -> None:
         if not self.force_control_k_writer:
             return
-        out = {field: row.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
-        out["timestamp"] = out["timestamp"] or utc_timestamp()
-        self.force_control_k_writer.writerow(out)
-        self._mark_dirty(force=True)
+        self._enqueue("force_control_k", dict(row))
 
     def write_force_control_log(self, row: dict) -> None:
         if not self.force_control_log_writer:
             return
-        out = {field: row.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
-        out["timestamp"] = out["timestamp"] or utc_timestamp()
-        self.force_control_log_writer.writerow(out)
-        self._mark_dirty()
+        self._enqueue("force_control_log", dict(row))
 
     def write_force_frame_mapping(self, row: dict) -> None:
         if not self.force_frame_mapping_writer:
             return
-        out = {field: row.get(field, "") for field in FORCE_FRAME_MAPPING_FIELDS}
-        out["timestamp"] = out["timestamp"] or utc_timestamp()
-        self.force_frame_mapping_writer.writerow(out)
-        self._mark_dirty(force=True)
+        self._enqueue("force_frame_mapping", dict(row))
 
     def __enter__(self) -> "CsvRecorder":
         self.start()

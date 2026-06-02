@@ -147,8 +147,13 @@ class MainWindow(QMainWindow):
         self.last_force_plot_update_s = 0.0
         self.last_cap_plot_update_s = 0.0
         self.last_cal_progress_update_s = 0.0
+        self.last_status_update_s = 0.0
         self.max_mini45_items_per_tick = 500
         self.max_esp32_items_per_tick = 200
+        self.max_motion_items_per_tick = 100
+        self.mini45_drain_budget_s = 0.008
+        self.esp32_drain_budget_s = 0.003
+        self.motion_drain_budget_s = 0.002
 
         self._build_ui()
         self.timer = QTimer(self)
@@ -1642,7 +1647,8 @@ class MainWindow(QMainWindow):
         if not self.esp32:
             return
         processed = 0
-        while processed < self.max_esp32_items_per_tick:
+        deadline = time.perf_counter() + self.esp32_drain_budget_s
+        while processed < self.max_esp32_items_per_tick and time.perf_counter() < deadline:
             try:
                 item = self.esp32.out_queue.get_nowait()
             except queue.Empty:
@@ -1669,7 +1675,8 @@ class MainWindow(QMainWindow):
         if not self.mini45:
             return
         processed = 0
-        while processed < self.max_mini45_items_per_tick:
+        deadline = time.perf_counter() + self.mini45_drain_budget_s
+        while processed < self.max_mini45_items_per_tick and time.perf_counter() < deadline:
             try:
                 item = self.mini45.out_queue.get_nowait()
             except queue.Empty:
@@ -1722,11 +1729,14 @@ class MainWindow(QMainWindow):
     def _drain_motion(self) -> None:
         if not self.motion:
             return
-        while True:
+        processed = 0
+        deadline = time.perf_counter() + self.motion_drain_budget_s
+        while processed < self.max_motion_items_per_tick and time.perf_counter() < deadline:
             try:
                 item = self.motion.out_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if isinstance(item, MotionMessage):
                 if item.kind == "POS":
                     for axis in ("X", "Y", "Z"):
@@ -1891,7 +1901,30 @@ class MainWindow(QMainWindow):
             self.stop_auto_force(str(exc))
 
     def _update_status(self) -> None:
-        samples = self.buffer.window(time.monotonic(), self.stable_window.value())
+        now = time.monotonic()
+        active_interval = 0.2
+        idle_interval = 0.5
+        interval = active_interval if (self.auto_force_active or self.auto_force_holding or self.training_active or self.k_ident_active) else idle_interval
+        if now - self.last_status_update_s < interval:
+            return
+        self.last_status_update_s = now
+
+        if self.zero_drift_active:
+            safe = True
+            if self.latest_force_sample:
+                sample = self.latest_force_sample
+                safe = abs(sample.fz) <= 10.0 and abs(sample.fx) <= 4.0 and abs(sample.fy) <= 4.0
+            self.window_label.setText("目标窗口：零点采集中")
+            self.stable_label.setText("稳定状态：--")
+            self.safe_label.setText(f"安全状态：{self._yes_no(safe)}")
+            self.window_label.setStyleSheet("color: #666")
+            self.stable_label.setStyleSheet("color: #666")
+            self.safe_label.setStyleSheet("color: green" if safe else "color: red")
+            if self.mini45 and self.last_force_time > 0.0 and now - self.last_force_time > 1.0:
+                self.mini_status.setText("Mini45 状态：数据超过 1 秒未更新")
+            return
+
+        samples = self.buffer.window(now, self.stable_window.value())
         meta = self._meta()
         result = evaluate_three_axis_stability(samples, meta, self._stability_settings(), SafetySettings())
         self.window_label.setText(f"目标窗口：{self._yes_no(result.in_window)}")
@@ -1900,7 +1933,7 @@ class MainWindow(QMainWindow):
         self.window_label.setStyleSheet("color: green" if result.in_window else "color: #a66")
         self.stable_label.setStyleSheet("color: green" if result.stable else "color: #a66")
         self.safe_label.setStyleSheet("color: green" if result.safe else "color: red")
-        if self.mini45 and self.last_force_time > 0.0 and time.monotonic() - self.last_force_time > 1.0:
+        if self.mini45 and self.last_force_time > 0.0 and now - self.last_force_time > 1.0:
             self.mini_status.setText("Mini45 状态：数据超过 1 秒未更新")
 
     def _meta(self) -> ExperimentMeta:

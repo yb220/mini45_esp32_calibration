@@ -124,11 +124,24 @@ class ArduinoMotionAdapter:
             raise RuntimeError("pyserial is not installed")
         self.port = port
         self.baud = baud
-        self.out_queue: queue.Queue[MotionMessage] = queue.Queue()
+        self.out_queue: queue.Queue[MotionMessage] = queue.Queue(maxsize=500)
         self._serial = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._write_lock = threading.Lock()
+
+    def _put_output(self, item: MotionMessage) -> None:
+        try:
+            self.out_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self.out_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.out_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def start(self) -> None:
         self._serial = serial.Serial(self.port, self.baud, timeout=0.1)
@@ -208,9 +221,9 @@ class ArduinoMotionAdapter:
                 line = raw.decode("utf-8", errors="replace").strip()
                 parsed = parse_motion_line(line)
                 if parsed is not None:
-                    self.out_queue.put(parsed)
+                    self._put_output(parsed)
             except Exception as exc:
-                self.out_queue.put(MotionMessage("error", "SERIAL", f"Arduino motion serial error: {exc}"))
+                self._put_output(MotionMessage("error", "SERIAL", f"Arduino motion serial error: {exc}"))
                 time.sleep(0.2)
 
 

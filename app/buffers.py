@@ -26,8 +26,17 @@ class SampleBuffer:
 
     def window(self, end_s: float, seconds: float) -> list[CombinedSnapshot]:
         start_s = end_s - seconds
+        window_items: list[CombinedSnapshot] = []
         with self._lock:
-            return [item for item in self._items if start_s <= item.monotonic_s <= end_s]
+            # 数据按时间顺序追加，取最近窗口时从尾部反向扫描即可，避免每次扫完整缓存。
+            for item in reversed(self._items):
+                if item.monotonic_s > end_s:
+                    continue
+                if item.monotonic_s < start_s:
+                    break
+                window_items.append(item)
+        window_items.reverse()
+        return window_items
 
     def all(self) -> list[CombinedSnapshot]:
         with self._lock:

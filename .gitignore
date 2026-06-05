@@ -19,6 +19,9 @@ runs/
 *.csv
 *.log
 
+# MC1081 本地诊断测试工具与采集结果
+esp32_mc1081_diagnostic/
+
 # 本地配置与临时文件
 config.yaml
 *.tmp

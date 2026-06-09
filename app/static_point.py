@@ -10,13 +10,12 @@ from .models import CapSample, CombinedSnapshot
 def collection_tolerances(
     entry_tolerances: tuple[float, float, float] = (0.05, 0.05, 0.08),
     full_scales: tuple[float, float, float] = (4.0, 4.0, 10.0),
-    entry_multiplier: float = 1.5,
-    full_scale_ratio: float = 0.015,
+    full_scale_ratios: tuple[float, float, float] = (0.015, 0.015, 0.010),
 ) -> tuple[float, float, float]:
     """采集保持窗口同时考虑严格进入窗口和各轴满量程。"""
     return tuple(
-        max(float(entry) * float(entry_multiplier), float(full_scale) * float(full_scale_ratio))
-        for entry, full_scale in zip(entry_tolerances, full_scales)
+        max(float(entry), float(full_scale) * float(ratio))
+        for entry, full_scale, ratio in zip(entry_tolerances, full_scales, full_scale_ratios)
     )
 
 

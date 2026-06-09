@@ -107,9 +107,9 @@ class StaticPointCollectorTests(unittest.TestCase):
 
     def test_collection_tolerances_are_scaled_by_full_range(self):
         fx, fy, fz = collection_tolerances()
-        self.assertAlmostEqual(fx, 0.075)
-        self.assertAlmostEqual(fy, 0.075)
-        self.assertAlmostEqual(fz, 0.15)
+        self.assertAlmostEqual(fx, 0.06)
+        self.assertAlmostEqual(fy, 0.06)
+        self.assertAlmostEqual(fz, 0.10)
         self.assertEqual(StaticPointCollector().preserve_threshold, 36)
 
 

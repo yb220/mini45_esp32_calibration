@@ -87,7 +87,7 @@ from .models import (
 )
 from .recorder import CsvRecorder
 from .stability import build_calibration_point, evaluate_three_axis_stability
-from .static_point import StaticPointCollector
+from .static_point import StaticPointCollector, collection_tolerances
 from .workflow import WorkflowState
 
 
@@ -1599,9 +1599,17 @@ class MainWindow(QMainWindow):
         self.workflow_profile_label.setText(f"MC1081 配置：{profile_text}，实际 {hz_text}")
         collector = self.static_point_collector
         if collector:
+            if collector.preserving_progress:
+                point_state = f"保留进度等待力恢复，已保留 {len(collector.cap_samples)} 帧"
+            elif collector.collection_paused:
+                point_state = f"越界暂停 {collector.outside_elapsed_s:.1f}/{collector.out_of_window_grace_s:.1f} s"
+            elif collector.collecting:
+                point_state = "采集中"
+            else:
+                point_state = f"稳定保持 {collector.stable_elapsed_s:.1f}/{collector.stable_hold_s:.1f} s"
             self.workflow_point_label.setText(
                 f"静态点 {self.sequence_index + 1}/{len(self.sequence_targets)}，重试 {collector.retry_count}/2，"
-                f"稳定保持 {collector.stable_elapsed_s:.1f}/5.0 s，电容样本 {len(collector.cap_samples)}/45"
+                f"{point_state}，电容样本 {len(collector.cap_samples)}/{collector.required_cap_samples}"
             )
         else:
             self.workflow_point_label.setText("静态点：--，稳定保持 0.0/5.0 s，电容样本 0/45")
@@ -2102,17 +2110,43 @@ class MainWindow(QMainWindow):
         reason = self._display_reason(result.reject_reason) if result.reject_reason else "通过"
         self._log(f"标记 {self.marker_id}：有效={self._yes_no(result.stable)}，原因={reason}")
 
+    @staticmethod
+    def _force_within_tolerances(sample, meta: ExperimentMeta, tolerances: tuple[float, float, float]) -> bool:
+        return bool(
+            sample
+            and abs(sample.fx - meta.target_fx) <= tolerances[0]
+            and abs(sample.fy - meta.target_fy) <= tolerances[1]
+            and abs(sample.fz - meta.target_fz) <= tolerances[2]
+        )
+
+    def _static_collection_force_in_window(self) -> bool:
+        if not self.static_point_collector or not self.active_target or not self.latest_force_sample:
+            return False
+        return self._force_within_tolerances(
+            self.latest_force_sample,
+            self._meta(),
+            collection_tolerances(),
+        )
+
     def _update_static_point_collection(self) -> None:
         collector = self.static_point_collector
         if self.calibration_mode != "sequence" or not collector or not self.active_target or self.calibration_paused:
             return
         now = time.monotonic()
         meta = self._meta()
+        strict_tolerances = (0.05, 0.05, 0.08)
+        hold_tolerances = collection_tolerances(strict_tolerances)
         settings = StabilitySettings(
             stable_window_s=5.0,
-            tolerance_fx=0.05,
-            tolerance_fy=0.05,
-            tolerance_fz=0.08,
+            tolerance_fx=strict_tolerances[0],
+            tolerance_fy=strict_tolerances[1],
+            tolerance_fz=strict_tolerances[2],
+        )
+        hold_settings = StabilitySettings(
+            stable_window_s=5.0,
+            tolerance_fx=hold_tolerances[0],
+            tolerance_fy=hold_tolerances[1],
+            tolerance_fz=hold_tolerances[2],
         )
         # 使用短窗口判断当前力是否稳定，再由 StaticPointCollector 连续计满 5 s，
         # 避免先等待一个完整 5 s 窗口后又重复计时 5 s。
@@ -2122,14 +2156,35 @@ class MainWindow(QMainWindow):
             if sample.fx is not None and sample.fy is not None and sample.fz is not None
         ]
         result = evaluate_three_axis_stability(force_samples, meta, settings, SafetySettings())
+        hold_result = evaluate_three_axis_stability(force_samples, meta, hold_settings, SafetySettings())
         current = self.latest_force_sample
-        in_window = bool(
-            current
-            and abs(current.fx - meta.target_fx) <= 0.05
-            and abs(current.fy - meta.target_fy) <= 0.05
-            and abs(current.fz - meta.target_fz) <= 0.08
+        in_window = self._force_within_tolerances(current, meta, strict_tolerances)
+        collection_in_window = self._force_within_tolerances(current, meta, hold_tolerances)
+        retained_samples = len(collector.cap_samples)
+        state_event = collector.update_force_state(
+            now,
+            in_window=in_window,
+            stable=result.stable,
+            collection_in_window=collection_in_window,
+            collection_stable=hold_result.stable,
         )
-        collector.update_force_state(now, in_window=in_window, stable=result.stable)
+        if state_event == "collection_reset":
+            self._write_workflow_event(
+                "static_collection_reset",
+                "retry",
+                f"持续超出采集保持窗口，丢弃 {retained_samples} 个电容样本",
+            )
+            self._log(f"持续超出采集保持窗口，已丢弃当前静态点的 {retained_samples} 个电容样本并重新稳定")
+        elif state_event == "collection_preserved":
+            self._write_workflow_event(
+                "static_collection_preserved",
+                "paused",
+                f"已采集 {retained_samples}/{collector.required_cap_samples}，保留进度等待力恢复",
+            )
+            self._log(
+                f"静态点已采集 {retained_samples}/{collector.required_cap_samples}，"
+                "持续越界后保留进度并等待力恢复"
+            )
 
         if collector.complete:
             bounds = collector.time_bounds
@@ -2143,6 +2198,7 @@ class MainWindow(QMainWindow):
                 and sample.fx is not None
                 and sample.fy is not None
                 and sample.fz is not None
+                and self._force_within_tolerances(sample, meta, hold_tolerances)
             ]
             samples = selected_force + collector.selected_cap_samples()
             final_result = evaluate_three_axis_stability(samples, meta, settings, SafetySettings())
@@ -2259,7 +2315,11 @@ class MainWindow(QMainWindow):
                         self.recorder.write_zero_drift_raw(snapshot)
                 if self.zero_drift_active and not self.calibration_paused:
                     self.zero_drift_sample_count += 1
-                if self.static_point_collector and not self.calibration_paused:
+                if (
+                    self.static_point_collector
+                    and not self.calibration_paused
+                    and self._static_collection_force_in_window()
+                ):
                     self.static_point_collector.add_cap_sample(item)
                 self._add_cap_plot(item)
 

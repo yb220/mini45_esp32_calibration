@@ -39,6 +39,11 @@ class CapSample:
     c4: float
     esp_ms: Optional[int] = None
     sequence: Optional[int] = None
+    cap_profile: str = ""
+    mc1081_cnt: Optional[int] = None
+    mc1081_cavg: Optional[int] = None
+    cap_nominal_hz: Optional[float] = None
+    cap_effective_hz: Optional[float] = None
     source: str = "esp32"
 
 
@@ -68,6 +73,11 @@ class CombinedSnapshot:
     mini45_status: Optional[int] = None
     esp_ms: Optional[int] = None
     esp_sequence: Optional[int] = None
+    cap_profile: str = ""
+    mc1081_cnt: Optional[int] = None
+    mc1081_cavg: Optional[int] = None
+    cap_nominal_hz: Optional[float] = None
+    cap_effective_hz: Optional[float] = None
 
     @classmethod
     def from_force(cls, sample: ForceSample, raw_sample: ForceSample | None = None) -> "CombinedSnapshot":
@@ -105,6 +115,11 @@ class CombinedSnapshot:
             c4=sample.c4,
             esp_ms=sample.esp_ms,
             esp_sequence=sample.sequence,
+            cap_profile=sample.cap_profile,
+            mc1081_cnt=sample.mc1081_cnt,
+            mc1081_cavg=sample.mc1081_cavg,
+            cap_nominal_hz=sample.cap_nominal_hz,
+            cap_effective_hz=sample.cap_effective_hz,
         )
 
     def to_row(self) -> dict:
@@ -132,7 +147,8 @@ class StabilitySettings:
     target_force_std_max_n: float = 0.03
     target_force_std_percent_fs: float = 0.01
     cross_axis_ratio_max: float = 0.10
-    capacitance_jump_max_pf: float = 0.05
+    capacitance_p95p5_max_pf: float = 0.06
+    capacitance_std_max_pf: float = 0.02
     torque_abs_max: float = 1.0
     tolerance_fx: float = 0.10
     tolerance_fy: float = 0.10
@@ -198,6 +214,19 @@ class CalibrationPoint:
     valid: bool
     reject_reason: str
     note: str
+    Fx_trimmed_mean: float = float("nan")
+    Fy_trimmed_mean: float = float("nan")
+    Fz_trimmed_mean: float = float("nan")
+    Mx_trimmed_mean: float = float("nan")
+    My_trimmed_mean: float = float("nan")
+    Mz_trimmed_mean: float = float("nan")
+    C0_trimmed_mean: float = float("nan")
+    C1_trimmed_mean: float = float("nan")
+    C2_trimmed_mean: float = float("nan")
+    C3_trimmed_mean: float = float("nan")
+    C4_trimmed_mean: float = float("nan")
+    cap_sample_count: int = 0
+    force_sample_count: int = 0
 
     def to_row(self) -> dict:
         return asdict(self)

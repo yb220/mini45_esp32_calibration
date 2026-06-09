@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from app.esp32_serial import Esp32Log, parse_cap_line
+from app.esp32_serial import Esp32Log, Esp32ProfileStatus, parse_cap_line
 from app.mini45_netft import build_rdt_command, parse_rdt_packet
 from app.models import CapSample
 
@@ -20,6 +20,22 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(item.esp_ms, 1234)
         self.assertEqual(item.sequence, 7)
         self.assertAlmostEqual(item.c2, 3.3)
+
+    def test_parse_profiled_stream_cap(self):
+        item = parse_cap_line(
+            "CAP,1234,7,1.1,2.2,3.3,4.4,5.5,STATIC_PRECISION,255,32,2.262325",
+            monotonic_s=10.0,
+        )
+        self.assertIsInstance(item, CapSample)
+        self.assertEqual(item.cap_profile, "STATIC_PRECISION")
+        self.assertEqual(item.mc1081_cnt, 255)
+        self.assertEqual(item.mc1081_cavg, 32)
+
+    def test_parse_profile_status(self):
+        item = parse_cap_line("L:PROFILE,TRAINING_BALANCED,cnt=191,cavg=8,nominal_hz=11.363636")
+        self.assertIsInstance(item, Esp32ProfileStatus)
+        self.assertEqual(item.name, "TRAINING_BALANCED")
+        self.assertEqual(item.cnt, 191)
 
     def test_parse_log_and_error(self):
         self.assertIsInstance(parse_cap_line("L:ok"), Esp32Log)

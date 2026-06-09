@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import random
 import time
 from pathlib import Path
 
@@ -38,6 +39,8 @@ from .calibration import (
     generate_training_trajectory,
     generate_fz_sequence,
     generate_shear_sequence,
+    generate_three_axis_sequence,
+    advance_ramped_force_target,
     parse_force_levels,
     training_target_reached,
     training_target_timed_out,
@@ -60,7 +63,8 @@ from .arduino_motion import (
     mm_to_pulses,
     parse_axis_position,
 )
-from .esp32_serial import Esp32Log, Esp32SerialAdapter
+from .esp32_serial import Esp32Log, Esp32ProfileStatus, Esp32SerialAdapter
+from .acquisition_profiles import STATIC_PRECISION, TRAINING_BALANCED, TRAINING_FAST, get_acquisition_profile
 from .force_filter import ForceFilterSettings, ForceLowPassFilter
 from .force_frame import AxisFrameMap, ForceFrameMapping, transform_force_sample
 from .force_control import (
@@ -83,6 +87,8 @@ from .models import (
 )
 from .recorder import CsvRecorder
 from .stability import build_calibration_point, evaluate_three_axis_stability
+from .static_point import StaticPointCollector
+from .workflow import WorkflowState
 
 
 class MainWindow(QMainWindow):
@@ -139,6 +145,21 @@ class MainWindow(QMainWindow):
         self.k_ident_before_stds: dict[str, list[float]] = {}
         self.k_ident_after_stds: dict[str, list[float]] = {}
         self.force_mapping_error_logged = False
+        self.current_cap_profile = ""
+        self.current_cap_effective_hz = 0.0
+        self.profile_switch_target = ""
+        self.profile_switch_started_s = 0.0
+        self.profile_switch_retry = 0
+        self.static_point_collector: StaticPointCollector | None = None
+        self.workflow = WorkflowState()
+        self.workflow_stage_started = False
+        self.workflow_pause_started_s = 0.0
+        self.workflow_training_trajectory_index = 0
+        self.workflow_training_trajectories = ("fx_roundtrip", "fy_roundtrip", "diagonal_roundtrip", "random_perturb")
+        self.workflow_random_targets: dict[str, list[TrainingTarget]] = {}
+        self.training_profile = TRAINING_BALANCED.name
+        self.training_ramp_target = (0.0, 0.0, 0.0)
+        self.training_last_ramp_update_s = 0.0
 
         self.force_x: list[float] = []
         self.force_y = {key: [] for key in ("fx", "fy", "fz")}
@@ -173,6 +194,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_force_frame_group())
         layout.addWidget(self._build_force_control_group())
+        layout.addWidget(self._build_workflow_group())
         layout.addWidget(self._build_calibration_group())
 
         status_plots = QHBoxLayout()
@@ -447,6 +469,39 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.k_status, 8, 0, 1, 4)
         return box
 
+    def _build_workflow_group(self) -> QGroupBox:
+        box = QGroupBox("完整自动实验")
+        grid = QGridLayout(box)
+        self.workflow_balanced_enabled = QCheckBox("执行平衡频率训练")
+        self.workflow_balanced_enabled.setChecked(True)
+        self.workflow_fast_enabled = QCheckBox("执行高速补充训练")
+        self.workflow_fast_enabled.setChecked(True)
+        self.workflow_start_btn = QPushButton("开始完整自动实验")
+        self.workflow_start_btn.clicked.connect(self.start_full_workflow)
+        self.workflow_pause_btn = QPushButton("暂停")
+        self.workflow_pause_btn.clicked.connect(self.pause_full_workflow)
+        self.workflow_resume_btn = QPushButton("继续")
+        self.workflow_resume_btn.clicked.connect(self.resume_full_workflow)
+        self.workflow_stop_btn = QPushButton("停止/急停")
+        self.workflow_stop_btn.clicked.connect(lambda: self.abort_full_workflow("人工停止"))
+        self.workflow_status_label = QLabel("完整流程：未运行")
+        self.workflow_profile_label = QLabel("MC1081 配置：未确认")
+        self.workflow_point_label = QLabel("静态点：--，稳定保持 0.0/5.0 s，电容样本 0/45")
+        self.workflow_count_label = QLabel("完成 0，无效 0，训练跳过 0")
+
+        grid.addWidget(self.workflow_balanced_enabled, 0, 0)
+        grid.addWidget(self.workflow_fast_enabled, 0, 1)
+        grid.addWidget(self.workflow_start_btn, 0, 2)
+        grid.addWidget(self.workflow_pause_btn, 0, 3)
+        grid.addWidget(self.workflow_resume_btn, 0, 4)
+        grid.addWidget(self.workflow_stop_btn, 0, 5)
+        grid.addWidget(self.workflow_status_label, 1, 0, 1, 3)
+        grid.addWidget(self.workflow_profile_label, 1, 3, 1, 3)
+        grid.addWidget(self.workflow_point_label, 2, 0, 1, 4)
+        grid.addWidget(self.workflow_count_label, 2, 4, 1, 2)
+        self._update_workflow_ui()
+        return box
+
     def _build_calibration_group(self) -> QGroupBox:
         box = QGroupBox("标定控制")
         layout = QVBoxLayout(box)
@@ -462,6 +517,7 @@ class MainWindow(QMainWindow):
         self.experiment_mode.addItem("训练数据采集", "combined")
         self.load_axis = QComboBox()
         self.load_axis.addItems(["Fx", "Fy", "Fz"])
+        self.load_axis.addItem("三轴自动(Fz→Fx→Fy)", "all")
         self.load_axis.setCurrentText("Fz")
         self.branch = QComboBox()
         self.branch.addItem("加载", "loading")
@@ -499,9 +555,9 @@ class MainWindow(QMainWindow):
         self.target_fx = self._spin(-20, 20, 0)
         self.target_fy = self._spin(-20, 20, 0)
         self.target_fz = self._spin(-20, 20, 0)
-        self.tol_fx = self._spin(0, 5, 0.10)
-        self.tol_fy = self._spin(0, 5, 0.10)
-        self.tol_fz = self._spin(0, 5, 0.10)
+        self.tol_fx = self._spin(0, 5, 0.05)
+        self.tol_fy = self._spin(0, 5, 0.05)
+        self.tol_fz = self._spin(0, 5, 0.08)
         for row, name, target, tolerance in (
             (0, "Fx", self.target_fx, self.tol_fx),
             (1, "Fy", self.target_fy, self.tol_fy),
@@ -511,7 +567,7 @@ class MainWindow(QMainWindow):
             grid.addWidget(target, row, 1)
             grid.addWidget(QLabel(f"容差 {name}"), row, 2)
             grid.addWidget(tolerance, row, 3)
-        self.stable_window = self._spin(0.5, 20, 2.0)
+        self.stable_window = self._spin(0.5, 20, 5.0)
         self.hold_window = self._spin(0.5, 30, 5.0)
         grid.addWidget(QLabel("稳定时间 s"), 3, 0)
         grid.addWidget(self.stable_window, 3, 1)
@@ -555,7 +611,7 @@ class MainWindow(QMainWindow):
 
         self.combined_group = QGroupBox("训练数据采集")
         form = QFormLayout(self.combined_group)
-        self.training_fz_levels = QLineEdit("3,5,7,9")
+        self.training_fz_levels = QLineEdit("1,2,3,4,5,6,7,8,9")
         self.training_trajectory_type = QComboBox()
         self.training_trajectory_type.addItem("Fx往返", "fx_roundtrip")
         self.training_trajectory_type.addItem("Fy往返", "fy_roundtrip")
@@ -650,7 +706,7 @@ class MainWindow(QMainWindow):
 
     def update_calibration_mode_ui(self) -> None:
         mode = self._combo_value(self.experiment_mode)
-        axis = self.load_axis.currentText()
+        axis = self._combo_value(self.load_axis)
         is_zero = mode == "zero"
         is_single = mode == "single"
         is_sequence = mode == "sequence"
@@ -668,9 +724,9 @@ class MainWindow(QMainWindow):
         self.training_random_points_label.setVisible(random_training)
         self.training_random_points.setVisible(random_training)
 
-        shear_axis = axis in {"Fx", "Fy"}
+        shear_axis = axis in {"Fx", "Fy", "all"}
         for widget in (self.seq_fz_label, self.seq_fz_max, self.seq_fz_step):
-            widget.setVisible(is_sequence and axis == "Fz")
+            widget.setVisible(is_sequence and axis in {"Fz", "all"})
         for widget in (self.seq_shear_label, self.seq_shear_max, self.seq_shear_step, self.seq_shear_direction_label, self.seq_shear_direction):
             widget.setVisible(is_sequence and shear_axis)
         self.cal_pause_btn.setVisible(is_single or is_sequence or is_combined)
@@ -1058,6 +1114,8 @@ class MainWindow(QMainWindow):
         self._log(f"K 辨识失败：{reason}")
         self._update_force_frame_mapping_lock()
         self._update_calibration_buttons()
+        if self.workflow.active and self.workflow.stage == "k_identification":
+            self.abort_full_workflow(f"K 辨识失败：{reason}")
 
     def _force_sample_window(self, seconds: float):
         return force_stats(self.buffer.window(time.monotonic(), seconds))
@@ -1173,9 +1231,13 @@ class MainWindow(QMainWindow):
         if result.valid:
             self._log(f"K 辨识完成：条件数 {result.condition:.3f}")
             self.cal_status.setText("标定状态：K 辨识完成，可开始自动力控")
+            if self.workflow.active and self.workflow.stage == "k_identification":
+                self._advance_workflow()
         else:
             self._log(f"K 辨识无效：{result.reject_reason}")
             QMessageBox.warning(self, "K 辨识", f"K 辨识无效：{result.reject_reason}")
+            if self.workflow.active and self.workflow.stage == "k_identification":
+                self.abort_full_workflow(f"K 辨识无效：{result.reject_reason}")
         self._update_calibration_buttons()
 
     def update_k_display(self, result=None) -> None:
@@ -1224,6 +1286,330 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "实验批次", "请先点击“开始实验批次”，再开始当前子实验")
         return False
 
+    def _write_workflow_event(
+        self,
+        event: str,
+        status: str = "",
+        note: str = "",
+        profile_name: str | None = None,
+    ) -> None:
+        if not self.recorder:
+            return
+        profile_label = profile_name or self.current_cap_profile
+        profile = None
+        try:
+            profile = get_acquisition_profile(profile_label) if profile_label else None
+        except ValueError:
+            profile = None
+        self.recorder.write_workflow_event(
+            {
+                "event": event,
+                "stage": self.workflow.stage,
+                "status": status,
+                "cap_profile": profile_label,
+                "cnt": profile.cnt if profile else "",
+                "cavg": profile.cavg if profile else "",
+                "requested_hz": profile.nominal_hz if profile else "",
+                "effective_hz": self.current_cap_effective_hz or "",
+                "target_index": self.sequence_index if self.workflow.stage == "static_sequence" else self.training_target_index,
+                "retry_count": self.static_point_collector.retry_count if self.static_point_collector else self.profile_switch_retry,
+                "note": note,
+            }
+        )
+
+    def _request_cap_profile(self, name: str) -> None:
+        if not self.esp32:
+            raise RuntimeError("ESP32 未连接")
+        profile = get_acquisition_profile(name)
+        self.profile_switch_target = profile.name
+        self.profile_switch_started_s = time.monotonic()
+        self.current_cap_effective_hz = 0.0
+        self.esp32.set_profile(profile.name)
+        self._write_workflow_event("profile_switch_start", "running", profile.name, profile.name)
+        self._log(f"正在切换 MC1081 配置：{profile.name}")
+
+    def _profile_is_ready(self, name: str) -> bool:
+        if self.current_cap_profile != name or self.current_cap_effective_hz <= 0.0:
+            return False
+        nominal = get_acquisition_profile(name).nominal_hz
+        return abs(self.current_cap_effective_hz - nominal) / nominal <= 0.20
+
+    def start_full_workflow(self) -> None:
+        if self.workflow.active or self._calibration_active() or self.k_ident_active:
+            QMessageBox.warning(self, "完整自动实验", "当前已有实验流程正在运行")
+            return
+        if not self.esp32 or not self.mini45 or not self.motion:
+            QMessageBox.warning(self, "完整自动实验", "请先连接 ESP32、Mini45 和 Arduino")
+            return
+        if self._combo_value(self.esp_mode) != "stream":
+            QMessageBox.warning(self, "完整自动实验", "完整自动实验要求 ESP32 使用流式采集模式，以获得唯一 CAP 序号和采集配置字段")
+            return
+        if not self.latest_force_sample or not self._current_force_safe():
+            QMessageBox.warning(self, "完整自动实验", "当前没有安全有效的 Mini45 传感器坐标力数据")
+            return
+        try:
+            self.current_force_frame_mapping().validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "完整自动实验", f"传感器坐标映射无效：{exc}")
+            return
+        if self.recorder:
+            QMessageBox.warning(self, "完整自动实验", "请先结束当前实验批次，完整流程会自动创建新批次")
+            return
+        self.tol_fx.setValue(0.05)
+        self.tol_fy.setValue(0.05)
+        self.tol_fz.setValue(0.08)
+        self.stable_window.setValue(5.0)
+        self.toggle_recording()
+        if not self.recorder:
+            return
+        seed = random.SystemRandom().randint(1, 2_147_483_647)
+        self.workflow.start(seed)
+        self.workflow_stage_started = False
+        self.workflow_training_trajectory_index = 0
+        self.workflow_random_targets = {}
+        self._write_workflow_event("workflow_start", "running", f"random_seed={seed}")
+        self._update_workflow_ui()
+        self._start_workflow_stage()
+
+    def pause_full_workflow(self) -> None:
+        if not self.workflow.active:
+            return
+        if self.k_ident_active:
+            QMessageBox.warning(self, "完整自动实验", "K 辨识扰动过程中不能暂停；如需中断请点击停止/急停")
+            return
+        self.workflow.paused = True
+        self.workflow_pause_started_s = time.monotonic()
+        self.pause_calibration()
+        self._write_workflow_event("workflow_pause", "paused")
+        self._update_workflow_ui()
+
+    def resume_full_workflow(self) -> None:
+        if not self.workflow.active:
+            return
+        now = time.monotonic()
+        paused_s = max(0.0, now - self.workflow_pause_started_s)
+        if self.zero_drift_active:
+            self.zero_drift_start_s += paused_s
+        if self.static_point_collector:
+            self.static_point_collector.begin(now)
+        self.workflow_pause_started_s = 0.0
+        self.workflow.paused = False
+        self.resume_calibration()
+        self._write_workflow_event("workflow_resume", "running")
+        self._update_workflow_ui()
+
+    def abort_full_workflow(self, reason: str) -> None:
+        if not self.workflow.active:
+            return
+        self._write_workflow_event("workflow_abort", "failed", reason)
+        self.workflow.fail(reason)
+        self.stop_calibration(reason)
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        if self.recorder:
+            self.toggle_recording()
+        self._update_workflow_ui()
+
+    def _advance_workflow(self, event: str = "stage_complete") -> None:
+        if not self.workflow.active:
+            return
+        self._write_workflow_event(event, "complete")
+        self.workflow.advance()
+        self.workflow_stage_started = False
+        self._update_workflow_ui()
+        self._start_workflow_stage()
+
+    def _start_workflow_stage(self) -> None:
+        if not self.workflow.active or self.workflow.paused or self.workflow_stage_started:
+            return
+        self.workflow_stage_started = True
+        stage = self.workflow.stage
+        self._write_workflow_event("stage_start", "running")
+        if stage == "profile_static":
+            self.profile_switch_retry = 0
+            self._request_cap_profile(STATIC_PRECISION.name)
+        elif stage == "zero_drift":
+            self.calibration_mode = "zero"
+            self.start_zero_drift()
+        elif stage == "k_identification":
+            self.start_k_identification()
+            if not self.k_ident_active:
+                self.abort_full_workflow("K 辨识未能启动")
+        elif stage == "static_sequence":
+            self.calibration_mode = "sequence"
+            self.sequence_targets = generate_three_axis_sequence(
+                fz_max_force=self.seq_fz_max.value(),
+                fz_step=self.seq_fz_step.value(),
+                shear_max_force=self.seq_shear_max.value(),
+                shear_step=self.seq_shear_step.value(),
+                target_fz=0.0,
+                shear_direction_mode="both",
+                cycles=self.seq_cycles.value(),
+            )
+            self.sequence_index = 0
+            self.start_next_sequence_target()
+        elif stage == "profile_balanced":
+            if not self.workflow_balanced_enabled.isChecked():
+                self._advance_workflow("stage_skipped")
+            else:
+                self.profile_switch_retry = 0
+                self._request_cap_profile(TRAINING_BALANCED.name)
+        elif stage == "training_balanced":
+            if not self.workflow_balanced_enabled.isChecked():
+                self._advance_workflow("stage_skipped")
+            else:
+                self.training_profile = TRAINING_BALANCED.name
+                self.workflow_training_trajectory_index = 0
+                self._start_workflow_training_trajectory()
+        elif stage == "profile_fast":
+            if not self.workflow_fast_enabled.isChecked():
+                self._advance_workflow("stage_skipped")
+            else:
+                self.profile_switch_retry = 0
+                self._request_cap_profile(TRAINING_FAST.name)
+        elif stage == "training_fast":
+            if not self.workflow_fast_enabled.isChecked():
+                self._advance_workflow("stage_skipped")
+            else:
+                self.training_profile = TRAINING_FAST.name
+                self.workflow_training_trajectory_index = 0
+                self._start_workflow_training_trajectory()
+        elif stage == "return_zero":
+            self.calibration_mode = "workflow_return"
+            self.active_target = CalibrationTarget("combined", "none", "unloading", 0.0, 0.0, 0.0)
+            if not self.start_auto_force():
+                self.abort_full_workflow("自动回零启动失败")
+        elif stage == "finish":
+            self._finish_full_workflow()
+
+    def _start_workflow_training_trajectory(self) -> None:
+        if self.workflow_training_trajectory_index >= len(self.workflow_training_trajectories):
+            self._advance_workflow()
+            return
+        trajectory_type = self.workflow_training_trajectories[self.workflow_training_trajectory_index]
+        rng = random.Random(self.workflow.random_seed)
+        targets = generate_training_trajectory(
+            fz_levels=list(range(1, 10)),
+            shear_max=self.training_shear_max.value(),
+            trajectory_type=trajectory_type,
+            target_step_n=self.training_target_step.value(),
+            random_points=self.training_random_points.value(),
+            rng=rng,
+        )
+        self.start_training_collection(targets=targets, trajectory_type=trajectory_type, profile=self.training_profile)
+
+    def _finish_full_workflow(self) -> None:
+        self._write_workflow_event("workflow_complete", "complete")
+        self.workflow.active = False
+        self.workflow.stage = "已完成"
+        if self.recorder:
+            self.toggle_recording()
+        self._update_workflow_ui()
+        QMessageBox.information(self, "完整自动实验", "完整自动实验已完成，数据文件已关闭")
+
+    def _update_full_workflow(self) -> None:
+        if not self.workflow.active or self.workflow.paused:
+            return
+        stage = self.workflow.stage
+        if stage.startswith("profile_") and self.profile_switch_target:
+            if self._profile_is_ready(self.profile_switch_target):
+                self._write_workflow_event("profile_switch_complete", "complete", self.profile_switch_target)
+                self.profile_switch_target = ""
+                self._advance_workflow()
+                return
+            timeout = 15.0 if self.profile_switch_target == STATIC_PRECISION.name else 7.0
+            if time.monotonic() - self.profile_switch_started_s >= timeout:
+                if self.profile_switch_retry < 1:
+                    self.profile_switch_retry += 1
+                    self._request_cap_profile(self.profile_switch_target)
+                else:
+                    self.abort_full_workflow(f"MC1081 配置切换或频率验证失败：{self.profile_switch_target}")
+        self._update_workflow_ui()
+
+    def _update_workflow_ui(self) -> None:
+        if not hasattr(self, "workflow_start_btn"):
+            return
+        active = self.workflow.active
+        self.workflow_start_btn.setEnabled(not active)
+        self.workflow_pause_btn.setEnabled(active and not self.workflow.paused)
+        self.workflow_resume_btn.setEnabled(active and self.workflow.paused)
+        self.workflow_stop_btn.setEnabled(active)
+        self.workflow_balanced_enabled.setEnabled(not active)
+        self.workflow_fast_enabled.setEnabled(not active)
+        for widget in (
+            getattr(self, "experiment_mode", None),
+            getattr(self, "load_axis", None),
+            getattr(self, "experiment_id", None),
+            getattr(self, "note", None),
+            getattr(self, "seq_fz_max", None),
+            getattr(self, "seq_fz_step", None),
+            getattr(self, "seq_shear_max", None),
+            getattr(self, "seq_shear_step", None),
+            getattr(self, "seq_cycles", None),
+            getattr(self, "seq_shear_direction", None),
+            getattr(self, "zero_duration_s", None),
+            getattr(self, "target_fx", None),
+            getattr(self, "target_fy", None),
+            getattr(self, "target_fz", None),
+            getattr(self, "tol_fx", None),
+            getattr(self, "tol_fy", None),
+            getattr(self, "tol_fz", None),
+            getattr(self, "stable_window", None),
+            getattr(self, "training_fz_levels", None),
+            getattr(self, "training_trajectory_type", None),
+            getattr(self, "training_shear_max", None),
+            getattr(self, "training_target_step", None),
+            getattr(self, "training_arrival_window", None),
+            getattr(self, "training_max_wait_s", None),
+            getattr(self, "training_random_points", None),
+            getattr(self, "k_delta_x", None),
+            getattr(self, "k_delta_y", None),
+            getattr(self, "k_delta_z", None),
+            getattr(self, "k_wait_s", None),
+            getattr(self, "k_sample_s", None),
+            getattr(self, "k_condition_limit", None),
+            getattr(self, "auto_step_mm", None),
+            getattr(self, "auto_interval_s", None),
+            getattr(self, "auto_speed_mm_s", None),
+            getattr(self, "auto_min_effective_step_mm", None),
+            getattr(self, "control_style", None),
+            getattr(self, "k_ident_btn", None),
+            getattr(self, "k_clear_btn", None),
+            getattr(self, "cal_start_btn", None),
+            getattr(self, "record_btn", None),
+            getattr(self, "marker_btn", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(not active)
+        if self.workflow.failure_reason and not self.workflow.active:
+            stage = f"失败：{self.workflow.failure_reason}"
+        else:
+            stage = self.workflow.stage or "未运行"
+        self.workflow_status_label.setText(f"完整流程：{self.workflow.progress_text}，阶段 {stage}")
+        profile_text = self.current_cap_profile or "未确认"
+        hz_text = f"{self.current_cap_effective_hz:.2f} Hz" if self.current_cap_effective_hz > 0 else "-- Hz"
+        try:
+            profile = get_acquisition_profile(self.current_cap_profile)
+            profile_text = f"{profile.name}，CNT={profile.cnt}，CAVG={profile.cavg}"
+        except ValueError:
+            pass
+        self.workflow_profile_label.setText(f"MC1081 配置：{profile_text}，实际 {hz_text}")
+        collector = self.static_point_collector
+        if collector:
+            self.workflow_point_label.setText(
+                f"静态点 {self.sequence_index + 1}/{len(self.sequence_targets)}，重试 {collector.retry_count}/2，"
+                f"稳定保持 {collector.stable_elapsed_s:.1f}/5.0 s，电容样本 {len(collector.cap_samples)}/45"
+            )
+        else:
+            self.workflow_point_label.setText("静态点：--，稳定保持 0.0/5.0 s，电容样本 0/45")
+        self.workflow_count_label.setText(
+            f"完成 {self.workflow.completed_static_points}，无效 {self.workflow.invalid_static_points}，"
+            f"训练跳过 {self.workflow.skipped_training_targets}"
+        )
+
     def start_calibration(self) -> None:
         mode = self._combo_value(self.experiment_mode)
         if self._calibration_active() or self.k_ident_active:
@@ -1244,6 +1630,11 @@ class MainWindow(QMainWindow):
             self.start_zero_drift()
             return
         if mode == "single":
+            if self._combo_value(self.load_axis) == "all":
+                QMessageBox.warning(self, "单目标点标定", "三轴自动只用于静态正反程标定，请选择 Fx、Fy 或 Fz")
+                self.calibration_mode = ""
+                self._update_calibration_buttons()
+                return
             self.current_cycle_id = "cycle_001"
             self.active_target = CalibrationTarget(
                 axis=self._combo_value(self.load_axis),
@@ -1281,6 +1672,16 @@ class MainWindow(QMainWindow):
 
     def _build_sequence_targets(self) -> list[CalibrationTarget]:
         axis = self._combo_value(self.load_axis)
+        if axis == "all":
+            return generate_three_axis_sequence(
+                fz_max_force=self.seq_fz_max.value(),
+                fz_step=self.seq_fz_step.value(),
+                shear_max_force=self.seq_shear_max.value(),
+                shear_step=self.seq_shear_step.value(),
+                target_fz=self.target_fz.value(),
+                shear_direction_mode=self._combo_value(self.seq_shear_direction),
+                cycles=self.seq_cycles.value(),
+            )
         if axis == "Fz":
             return generate_fz_sequence(self.seq_fz_max.value(), self.seq_fz_step.value(), self.seq_cycles.value())
         return generate_shear_sequence(
@@ -1294,13 +1695,28 @@ class MainWindow(QMainWindow):
 
     def start_next_sequence_target(self) -> None:
         if self.sequence_index >= len(self.sequence_targets):
-            self.stop_calibration("静态正反程标定完成")
+            self.stop_auto_force("")
+            self.calibration_mode = ""
+            self.static_point_collector = None
+            if self.workflow.active and self.workflow.stage == "static_sequence":
+                self._advance_workflow()
+            else:
+                self.stop_calibration("静态正反程标定完成")
             return
         self.active_target = self.sequence_targets[self.sequence_index]
+        if self.workflow.active and self.workflow.stage == "static_sequence":
+            self.static_point_collector = StaticPointCollector()
+            self.static_point_collector.begin(time.monotonic())
+        else:
+            self.static_point_collector = None
         self._apply_target_to_ui(self.active_target)
         self.cal_status.setText(f"标定状态：正反程点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
         if not self.start_auto_force():
-            self.stop_calibration("启动失败")
+            self.static_point_collector = None
+            if self.workflow.active and self.workflow.stage == "static_sequence":
+                self.abort_full_workflow("静态正反程标定力控启动失败")
+            else:
+                self.stop_calibration("启动失败")
 
     def _apply_target_to_ui(self, target: CalibrationTarget) -> None:
         self._set_combo_by_data(self.load_axis, target.axis)
@@ -1310,16 +1726,23 @@ class MainWindow(QMainWindow):
         self.target_fy.setValue(target.target_fy)
         self.target_fz.setValue(target.target_fz)
 
-    def start_training_collection(self) -> None:
+    def start_training_collection(
+        self,
+        targets: list[TrainingTarget] | None = None,
+        trajectory_type: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         try:
-            fz_levels = parse_force_levels(self.training_fz_levels.text())
-            self.training_targets = generate_training_trajectory(
-                fz_levels=fz_levels,
-                shear_max=self.training_shear_max.value(),
-                trajectory_type=self._combo_value(self.training_trajectory_type),
-                target_step_n=self.training_target_step.value(),
-                random_points=self.training_random_points.value(),
-            )
+            if targets is None:
+                fz_levels = parse_force_levels(self.training_fz_levels.text())
+                targets = generate_training_trajectory(
+                    fz_levels=fz_levels,
+                    shear_max=self.training_shear_max.value(),
+                    trajectory_type=trajectory_type or self._combo_value(self.training_trajectory_type),
+                    target_step_n=self.training_target_step.value(),
+                    random_points=self.training_random_points.value(),
+                )
+            self.training_targets = list(targets)
         except Exception as exc:
             QMessageBox.warning(self, "训练数据采集", str(exc))
             return
@@ -1329,11 +1752,13 @@ class MainWindow(QMainWindow):
 
         self.training_count += 1
         self.current_cycle_id = f"training_{self.training_count:03d}"
+        self.training_profile = profile or self.current_cap_profile or TRAINING_BALANCED.name
         self.training_active = True
         self.training_target_index = 0
         self.training_current_target = None
+        self.active_target = CalibrationTarget("combined", "none", "loading", 0.0, 0.0, 0.0)
         if self.recorder:
-            self.recorder.start_training_files()
+            self.recorder.start_training_files(self.training_profile)
         self._write_training_marker("training_start")
         self._enter_training_target(0)
         self.start_auto_force()
@@ -1341,13 +1766,21 @@ class MainWindow(QMainWindow):
             self.finish_training_collection("启动失败")
             self._update_calibration_buttons()
             return
-        self._log("训练数据采集开始：仅写入 training_raw_timeseries.csv 和 training_markers.csv")
+        profile_label = "平衡频率" if self.training_profile == TRAINING_BALANCED.name else "高速补充"
+        self._log(f"训练数据采集开始：写入{profile_label}训练专用原始时序和 marker 文件")
         self._update_calibration_buttons()
 
     def _enter_training_target(self, index: int) -> None:
         self.training_target_index = index
         self.training_current_target = self.training_targets[index]
         self.training_target_start_s = time.monotonic()
+        self.training_last_ramp_update_s = self.training_target_start_s
+        if self.latest_force_sample:
+            self.training_ramp_target = (
+                self.latest_force_sample.fx,
+                self.latest_force_sample.fy,
+                self.latest_force_sample.fz,
+            )
         self._set_training_target(self.training_current_target)
         self._write_training_marker(self._training_start_marker_note(index))
 
@@ -1356,9 +1789,9 @@ class MainWindow(QMainWindow):
             axis="combined",
             direction=target.direction,
             branch=target.branch,
-            target_fx=target.target_fx,
-            target_fy=target.target_fy,
-            target_fz=target.target_fz,
+            target_fx=self.training_ramp_target[0],
+            target_fy=self.training_ramp_target[1],
+            target_fz=self.training_ramp_target[2],
         )
 
     def _training_start_marker_note(self, index: int) -> str:
@@ -1378,6 +1811,18 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         elapsed = now - self.training_target_start_s
         target = self.training_current_target
+        if self.latest_force_sample and self.active_target:
+            dt = max(0.0, now - self.training_last_ramp_update_s)
+            self.training_last_ramp_update_s = now
+            self.training_ramp_target = advance_ramped_force_target(
+                self.training_ramp_target,
+                (target.target_fx, target.target_fy, target.target_fz),
+                (self.latest_force_sample.fx, self.latest_force_sample.fy, self.latest_force_sample.fz),
+                rate_n_s=0.20,
+                elapsed_s=dt,
+                max_lag_n=0.20,
+            )
+            self.active_target.target_fx, self.active_target.target_fy, self.active_target.target_fz = self.training_ramp_target
         if self.latest_force_sample and training_target_reached(self.latest_force_sample, target, self.training_arrival_window.value()):
             self._write_training_marker("target_reached")
             self._advance_training_target()
@@ -1385,6 +1830,8 @@ class MainWindow(QMainWindow):
         if training_target_timed_out(elapsed, self.training_max_wait_s.value()):
             self._write_training_marker("target_timeout")
             self._write_training_marker("target_skipped")
+            if self.workflow.active:
+                self.workflow.skipped_training_targets += 1
             self._advance_training_target()
             return
         self.cal_status.setText(
@@ -1397,7 +1844,10 @@ class MainWindow(QMainWindow):
     def _advance_training_target(self) -> None:
         next_index = self.training_target_index + 1
         if next_index >= len(self.training_targets):
-            self.stop_calibration("训练数据采集完成")
+            if self.workflow.active and self.workflow.stage in {"training_balanced", "training_fast"}:
+                self.finish_training_collection("完成")
+            else:
+                self.stop_calibration("训练数据采集完成")
             return
         self._enter_training_target(next_index)
 
@@ -1413,6 +1863,12 @@ class MainWindow(QMainWindow):
         self.training_current_target = None
         self.training_pause_started_s = 0.0
         self._log(f"训练数据采集结束：{reason}")
+        if self.workflow.active and self.workflow.stage in {"training_balanced", "training_fast"}:
+            if "完成" in reason:
+                self.workflow_training_trajectory_index += 1
+                self._start_workflow_training_trajectory()
+            elif reason:
+                self.abort_full_workflow(f"训练数据采集异常结束：{reason}")
 
     def _write_training_marker(self, note: str) -> None:
         if not self.recorder:
@@ -1421,6 +1877,13 @@ class MainWindow(QMainWindow):
         meta = self._meta()
         meta.note = f"{meta.note}; {note}" if meta.note else note
         target = self.training_current_target
+        if target:
+            meta.target_fx = target.target_fx
+            meta.target_fy = target.target_fy
+            meta.target_fz = target.target_fz
+            meta.preload_n = target.target_fz
+            meta.direction = target.direction
+            meta.branch = target.branch
         self.recorder.write_training_marker(
             self.marker_id,
             meta,
@@ -1428,6 +1891,7 @@ class MainWindow(QMainWindow):
             phase=target.phase if target else note,
             target_shear_n=target.target_shear_n if target else "",
             target_angle_deg=target.target_angle_deg if target else "",
+            profile=self.training_profile,
         )
 
     def pause_calibration(self) -> None:
@@ -1436,6 +1900,8 @@ class MainWindow(QMainWindow):
         self.calibration_paused = True
         if self.training_active:
             self.training_pause_started_s = time.monotonic()
+        if self.static_point_collector:
+            self.static_point_collector.begin(time.monotonic())
         try:
             if self.motion:
                 self.motion.stop_all()
@@ -1450,6 +1916,7 @@ class MainWindow(QMainWindow):
         if self.training_active and self.training_pause_started_s > 0.0:
             self.training_target_start_s += time.monotonic() - self.training_pause_started_s
             self.training_pause_started_s = 0.0
+            self.training_last_ramp_update_s = time.monotonic()
         self.calibration_paused = False
         self.cal_status.setText("标定状态：继续")
         self._update_calibration_buttons()
@@ -1508,6 +1975,11 @@ class MainWindow(QMainWindow):
         if self.calibration_mode == "zero":
             self.calibration_mode = ""
         self._update_calibration_buttons()
+        if self.workflow.active and self.workflow.stage == "zero_drift":
+            if reason == "完成":
+                self._advance_workflow()
+            else:
+                self.abort_full_workflow(f"零点漂移异常结束：{reason}")
 
     def _write_marker_with_note(self, note: str) -> None:
         self.marker_id += 1
@@ -1567,6 +2039,13 @@ class MainWindow(QMainWindow):
             self._log(f"自动逼近停止：{reason}")
         self._update_calibration_buttons()
 
+    def _fail_auto_force(self, reason: str) -> None:
+        """自动流程中的力控故障必须终止整套实验，手动模式只停止当前力控。"""
+        if self.workflow.active:
+            self.abort_full_workflow(reason)
+        else:
+            self.stop_auto_force(reason)
+
     def toggle_recording(self) -> None:
         if self.recorder:
             if self.training_active or self.zero_drift_active or self.auto_force_active:
@@ -1623,16 +2102,109 @@ class MainWindow(QMainWindow):
         reason = self._display_reason(result.reject_reason) if result.reject_reason else "通过"
         self._log(f"标记 {self.marker_id}：有效={self._yes_no(result.stable)}，原因={reason}")
 
+    def _update_static_point_collection(self) -> None:
+        collector = self.static_point_collector
+        if self.calibration_mode != "sequence" or not collector or not self.active_target or self.calibration_paused:
+            return
+        now = time.monotonic()
+        meta = self._meta()
+        settings = StabilitySettings(
+            stable_window_s=5.0,
+            tolerance_fx=0.05,
+            tolerance_fy=0.05,
+            tolerance_fz=0.08,
+        )
+        # 使用短窗口判断当前力是否稳定，再由 StaticPointCollector 连续计满 5 s，
+        # 避免先等待一个完整 5 s 窗口后又重复计时 5 s。
+        force_samples = [
+            sample
+            for sample in self.buffer.window(now, 0.5)
+            if sample.fx is not None and sample.fy is not None and sample.fz is not None
+        ]
+        result = evaluate_three_axis_stability(force_samples, meta, settings, SafetySettings())
+        current = self.latest_force_sample
+        in_window = bool(
+            current
+            and abs(current.fx - meta.target_fx) <= 0.05
+            and abs(current.fy - meta.target_fy) <= 0.05
+            and abs(current.fz - meta.target_fz) <= 0.08
+        )
+        collector.update_force_state(now, in_window=in_window, stable=result.stable)
+
+        if collector.complete:
+            bounds = collector.time_bounds
+            if not bounds:
+                return
+            start_s, end_s = bounds
+            selected_force = [
+                sample
+                for sample in self.buffer.window(end_s, max(0.0, end_s - start_s) + 1e-6)
+                if start_s <= sample.monotonic_s <= end_s
+                and sample.fx is not None
+                and sample.fy is not None
+                and sample.fz is not None
+            ]
+            samples = selected_force + collector.selected_cap_samples()
+            final_result = evaluate_three_axis_stability(samples, meta, settings, SafetySettings())
+            if not final_result.stable and collector.retry(now):
+                self.auto_force_holding = False
+                self._write_workflow_event("static_point_retry", "retry", final_result.reject_reason)
+                self._log(
+                    f"静态点质量判定未通过，正在执行第 {collector.retry_count} 次重试："
+                    f"{self._display_reason(final_result.reject_reason)}"
+                )
+                return
+            self.marker_id += 1
+            if self.recorder:
+                self.recorder.write_marker(self.marker_id, meta)
+                point = build_calibration_point(samples, meta, self.marker_id, final_result.stable, final_result.reject_reason)
+                if point:
+                    selected_caps = collector.selected_cap_samples()
+                    point.timestamp_start = selected_caps[0].timestamp
+                    point.timestamp_end = selected_caps[-1].timestamp
+                    self.recorder.write_calibration_point(point)
+            if final_result.stable:
+                self.workflow.completed_static_points += 1
+                self._write_workflow_event("static_point_complete", "complete")
+            else:
+                self.workflow.invalid_static_points += 1
+                self._write_workflow_event("static_point_complete", "invalid", final_result.reject_reason)
+            self.sequence_index += 1
+            self.stop_auto_force("")
+            self.static_point_collector = None
+            self.start_next_sequence_target()
+            return
+
+        if collector.timed_out(now):
+            if collector.retry(now):
+                self.auto_force_holding = False
+                self._write_workflow_event("static_point_retry", "retry", "静态点超时")
+                self._log(f"静态点超时，正在执行第 {collector.retry_count} 次重试")
+            else:
+                self.marker_id += 1
+                invalid_meta = self._meta()
+                invalid_meta.note = f"{invalid_meta.note}; static_point_timeout" if invalid_meta.note else "static_point_timeout"
+                if self.recorder:
+                    self.recorder.write_marker(self.marker_id, invalid_meta)
+                self.workflow.invalid_static_points += 1
+                self._write_workflow_event("static_point_skipped", "invalid", "重试两次后仍超时")
+                self.sequence_index += 1
+                self.stop_auto_force("")
+                self.static_point_collector = None
+                self.start_next_sequence_target()
+
     def _tick(self) -> None:
         self._drain_esp32()
         self._drain_mini45()
         self._drain_motion()
         self._update_k_identification()
-        if self.zero_drift_active and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
+        if self.zero_drift_active and not self.calibration_paused and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
             self.finish_zero_drift("完成")
         self._update_calibration_progress_status()
         self._update_training_collection()
         self._update_auto_force()
+        self._update_static_point_collection()
+        self._update_full_workflow()
         self._update_status()
 
     def _update_calibration_progress_status(self) -> None:
@@ -1660,21 +2232,35 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
             processed += 1
-            if isinstance(item, Esp32Log):
+            if isinstance(item, Esp32ProfileStatus):
+                self.current_cap_profile = item.name
+                self.workflow_profile_label.setText(
+                    f"MC1081 配置：{item.name}，CNT={item.cnt}，CAVG={item.cavg}，实际 -- Hz"
+                )
+                self._log(f"ESP32 配置确认：{item.name}，CNT={item.cnt}，CAVG={item.cavg}")
+            elif isinstance(item, Esp32Log):
                 self._log(f"ESP32 {self._display_level(item.level)}：{item.message}")
+                if item.level == "error" and "PROFILE" in item.message.upper() and self.workflow.active:
+                    self.abort_full_workflow(f"ESP32 配置切换失败：{item.message}")
             elif isinstance(item, CapSample):
                 self.last_cap_time = item.monotonic_s
+                if item.cap_profile:
+                    self.current_cap_profile = item.cap_profile
+                if item.cap_effective_hz:
+                    self.current_cap_effective_hz = item.cap_effective_hz
                 snapshot = CombinedSnapshot.from_cap(item)
                 self.buffer.append(snapshot)
                 if self.recorder:
-                    if self.training_active:
-                        self.recorder.write_training_raw(snapshot)
+                    if self.training_active and not self.calibration_paused:
+                        self.recorder.write_training_raw(snapshot, self.training_profile)
                     elif self._static_raw_recording_active():
                         self.recorder.write_raw(snapshot)
-                    if self.zero_drift_active:
+                    if self.zero_drift_active and not self.calibration_paused:
                         self.recorder.write_zero_drift_raw(snapshot)
-                if self.zero_drift_active:
+                if self.zero_drift_active and not self.calibration_paused:
                     self.zero_drift_sample_count += 1
+                if self.static_point_collector and not self.calibration_paused:
+                    self.static_point_collector.add_cap_sample(item)
                 self._add_cap_plot(item)
 
     def _drain_mini45(self) -> None:
@@ -1714,17 +2300,19 @@ class MainWindow(QMainWindow):
                 raw_snapshot = CombinedSnapshot.from_force(mapped_item, raw_sample=item)
                 self.buffer.append(control_snapshot)
                 if self.recorder:
-                    if self.training_active:
-                        self.recorder.write_training_raw(raw_snapshot)
+                    if self.training_active and not self.calibration_paused:
+                        self.recorder.write_training_raw(raw_snapshot, self.training_profile)
                     elif self._static_raw_recording_active():
                         self.recorder.write_raw(raw_snapshot)
-                    if self.zero_drift_active:
+                    if self.zero_drift_active and not self.calibration_paused:
                         self.recorder.write_zero_drift_raw(raw_snapshot)
-                if self.zero_drift_active:
+                if self.zero_drift_active and not self.calibration_paused:
                     self.zero_drift_sample_count += 1
                 self._add_force_plot(filtered_item)
 
     def _static_raw_recording_active(self) -> bool:
+        if self.calibration_paused:
+            return False
         return bool(
             self.zero_drift_active
             or self.auto_force_active
@@ -1780,7 +2368,7 @@ class MainWindow(QMainWindow):
         if not self.auto_force_active:
             return
         if not self.motion:
-            self.stop_auto_force("Arduino 未连接")
+            self._fail_auto_force("Arduino 未连接")
             return
         if self.calibration_paused:
             return
@@ -1789,15 +2377,15 @@ class MainWindow(QMainWindow):
 
         now = time.monotonic()
         if now - self.last_force_time > 1.0:
-            self.stop_auto_force("Mini45 数据超过 1 秒未更新")
+            self._fail_auto_force("Mini45 数据超过 1 秒未更新")
             return
 
         sample = self.latest_force_sample
-        if abs(sample.fz) > 10.0 or abs(sample.fx) > 4.0 or abs(sample.fy) > 4.0:
-            self.stop_auto_force("力值超过安全限值")
+        if not self._current_force_safe():
+            self._fail_auto_force("力或力矩超过安全限值")
             return
         if not self.force_control_result or not self.force_control_result.valid:
-            self.stop_auto_force("K 未辨识或无效")
+            self._fail_auto_force("K 未辨识或无效")
             return
 
         meta = self._meta()
@@ -1812,6 +2400,19 @@ class MainWindow(QMainWindow):
             if self.training_active:
                 # 训练采集由 _update_training_collection 负责到达后立即切换目标，
                 # 这里不停车等待，避免连续加载数据出现人为停顿。
+                return
+            if self.workflow.active and self.workflow.stage == "return_zero":
+                self.stop_auto_force("")
+                self.calibration_mode = ""
+                self._advance_workflow()
+                return
+            if self.calibration_mode == "sequence" and self.static_point_collector:
+                if not self.auto_force_holding:
+                    self.auto_force_holding = True
+                    try:
+                        self.motion.stop_all()
+                    except Exception:
+                        pass
                 return
             if not self.auto_force_holding:
                 self.auto_force_holding = True
@@ -1905,7 +2506,7 @@ class MainWindow(QMainWindow):
                     }
                 )
         except Exception as exc:
-            self.stop_auto_force(str(exc))
+            self._fail_auto_force(str(exc))
 
     def _update_status(self) -> None:
         now = time.monotonic()
@@ -2081,6 +2682,10 @@ class MainWindow(QMainWindow):
                 translated.append(mapping[item])
             elif item.endswith(" cross-axis force too high"):
                 translated.append(item.replace(" cross-axis force too high", " 非目标方向力过大"))
+            elif item.endswith(" capacitance p95-p5 too high"):
+                translated.append(item.replace(" capacitance p95-p5 too high", " 电容P95-P5波动过大"))
+            elif item.endswith(" capacitance std too high"):
+                translated.append(item.replace(" capacitance std too high", " 电容标准差过大"))
             elif item.endswith(" capacitance jump too high"):
                 translated.append(item.replace(" capacitance jump too high", " 电容跳变过大"))
             else:

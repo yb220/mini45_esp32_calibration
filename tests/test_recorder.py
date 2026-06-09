@@ -12,6 +12,7 @@ from app.recorder import (
     MARKER_FIELDS,
     RAW_FIELDS,
     TRAINING_MARKER_FIELDS,
+    WORKFLOW_EVENT_FIELDS,
     CsvRecorder,
 )
 
@@ -71,16 +72,20 @@ class RecorderTests(unittest.TestCase):
             with (out / "calibration_points.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), CALIBRATION_FIELDS)
             self.assertFalse((out / "zero_drift_summary.csv").exists())
-            with (out / "training_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
+            with (out / "training_balanced_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), RAW_FIELDS)
-            with (out / "training_markers.csv").open(encoding="utf-8-sig") as f:
+            with (out / "training_balanced_markers.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), TRAINING_MARKER_FIELDS)
+            with (out / "training_fast_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
+                self.assertEqual(next(csv.reader(f)), RAW_FIELDS)
             with (out / "force_control_k.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_K_FIELDS)
             with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_LOG_FIELDS)
             with (out / "force_frame_mapping.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), FORCE_FRAME_MAPPING_FIELDS)
+            with (out / "workflow_events.csv").open(encoding="utf-8-sig") as f:
+                self.assertEqual(next(csv.reader(f)), WORKFLOW_EVENT_FIELDS)
 
     def test_zero_drift_timeseries_uses_raw_schema_and_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,15 +118,20 @@ class RecorderTests(unittest.TestCase):
             )
             recorder.start_training_files()
             recorder.write_training_raw(CombinedSnapshot(timestamp="t2", monotonic_s=2.0, source="mini45", fx=1.0))
+            recorder.start_training_files("TRAINING_FAST")
+            recorder.write_training_raw(CombinedSnapshot(timestamp="t3", monotonic_s=3.0, source="esp32", c0=2.0))
             recorder.stop()
 
-            with (out / "training_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
+            with (out / "training_balanced_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], RAW_FIELDS)
             self.assertEqual(len(rows), 3)
-            with (out / "training_markers.csv").open(encoding="utf-8-sig") as f:
+            with (out / "training_balanced_markers.csv").open(encoding="utf-8-sig") as f:
                 rows = list(csv.reader(f))
             self.assertEqual(rows[0], TRAINING_MARKER_FIELDS)
+            self.assertEqual(len(rows), 2)
+            with (out / "training_fast_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f))
             self.assertEqual(len(rows), 2)
 
     def test_force_control_files_are_written(self):

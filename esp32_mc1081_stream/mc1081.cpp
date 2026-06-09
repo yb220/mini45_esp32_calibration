@@ -44,17 +44,16 @@ bool MC1081_OSC2_Measure(CAP_AFE_DoubleEnded *cap, MC1081_InitStructure *init) {
   uint8_t status = 0x01;
   uint8_t dat[2] = {0};
   uint8_t overflow = 0;
-  int timeout = 500;
+  uint32_t wait_start_ms = millis();
 
   if (!CAP_AFE_Transmit(MC1081_ADDR, MC_STATUS, OF_CLEAR)) return false;
-  if (!CAP_AFE_Transmit(MC1081_ADDR, C_CMD, OSC2_EN | SLEEP_EN | CAVG_1 | OS_SD_ONE)) return false;
+  if (!CAP_AFE_Transmit(MC1081_ADDR, C_CMD, OSC2_EN | SLEEP_EN | init->MC1081_CAVG | OS_SD_ONE)) return false;
 
   do {
     delayMicroseconds(20);
     if (!CAP_AFE_Receive(MC1081_ADDR, MC_STATUS, &status, 1)) return false;
-    timeout--;
-  } while ((status & 0x01) && timeout > 0);
-  if (timeout <= 0) return false;
+  } while ((status & 0x01) && millis() - wait_start_ms < 10000UL);
+  if (status & 0x01) return false;
 
   if (!CAP_AFE_Receive(MC1081_ADDR, OSC2_OF, &overflow, 1)) return false;
   if (!CAP_AFE_Receive(MC1081_ADDR, DREF_MSB, dat, 2)) return false;

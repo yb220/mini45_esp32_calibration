@@ -66,6 +66,7 @@ typedef struct {
   MC1081_driver_i_config MC1081_DRIVEI;
   uint8_t MC1081_OSC2_CHANNEL;
   uint8_t MC1081_SHLD_CFG;
+  uint8_t MC1081_CAVG;
 } MC1081_InitStructure;
 
 typedef struct {
@@ -103,6 +104,8 @@ typedef enum {
 #define CAVG_POS 4
 #define CAVG_1 (0x00U << CAVG_POS)
 #define CAVG_4 (0x01U << CAVG_POS)
+#define CAVG_8 (0x02U << CAVG_POS)
+#define CAVG_32 (0x03U << CAVG_POS)
 #define OS_SD_ONE 0x03
 
 #endif

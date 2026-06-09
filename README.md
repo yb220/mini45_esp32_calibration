@@ -1,391 +1,212 @@
 # Mini45 + ESP32/MC1081 三维力传感器标定上位机
 
-本项目用于五通道柔性电容式三维力传感器的标定实验。上位机同时采集 ATI Mini45 六轴力/力矩、ESP32 + MC1081 五通道电容，并可通过 Arduino 控制三轴丝杆台自动加载。
+本项目用于五通道柔性电容式三维力传感器的自动标定与训练原始数据采集。
 
-上位机只负责实验控制和原始数据保存，不做时间戳匹配、插值、零点扣除、标准化、训练样本筛选或模型训练。为提高自动力控和 K 矩阵辨识的稳定性，界面提供 Mini45 上位机反馈滤波；该滤波只用于实时显示、稳定判定、K 辨识和电机控制，输出的原始时序文件仍保存未滤波的传感器坐标力和 Mini45 原始数据。
+上位机同时连接：
+
+- ATI Mini45 + NETBA：提供六轴力/力矩反馈。
+- ESP32 + MC1081：采集 `C0~C4` 五通道电容。
+- Arduino 三轴电机控制器：接收 `MOVE_MM` 指令控制丝杆台。
+
+上位机负责设备控制、实验编排和原始数据保存。时间戳匹配、插值、零点扣除、滤波、标准化、静态指标计算和模型训练应在后续独立数据分析项目中完成。
 
 ## 目录结构
 
 ```text
 mini45_esp32_calibration/
-  app/
-    main.py                 # PyQt5 上位机入口
-    gui.py                  # 主界面和实验流程
-    recorder.py             # CSV 批次文件写入
-    calibration.py          # 标定序列和训练轨迹生成
-    force_frame.py          # Mini45 到传感器坐标映射
-    force_filter.py         # Mini45 反馈滤波，服务于显示、K 辨识和力控
-    force_control.py        # K 矩阵辨识与解耦力控算法
-    stability.py            # 稳定判定和标定点生成
-    esp32_serial.py         # ESP32 串口采集
-    mini45_netft.py         # Mini45 NETBA / simulator
-    arduino_motion.py       # Arduino 三轴电机控制
-  arduino_motion_serial/    # Arduino 串口控制固件
-  esp32_mc1081_stream/      # ESP32/MC1081 采集固件
-  tests/                    # 无硬件单元测试
+├─ app/                         Python 上位机
+├─ esp32_mc1081_stream/         正式 ESP32/MC1081 采集固件
+├─ arduino_motion_serial/       Arduino 三轴电机串口固件
+├─ tests/                       单元测试
+├─ runs/                        默认实验批次输出目录
+├─ run_app_python3_9.bat        当前电脑推荐启动脚本
+├─ requirements.txt             Python 依赖
+├─ config.example.yaml          配置示例
+└─ CALIBRATION_TECHNICAL_DETAILS.md
 ```
 
-## 运行方式
+`esp32_mc1081_diagnostic/` 是独立诊断工具，不属于正式标定流程，也不上传 GitHub。
 
-推荐直接使用当前电脑的 Python 3.9 启动脚本：
+## 安装与运行
 
-```bat
-run_app_python3_9.bat
-```
+推荐使用现有 Conda `python3-9` 环境：
 
-也可以手动运行：
-
-```bash
-cd mini45_esp32_calibration
-python -m venv .venv
-.venv\Scripts\activate
+```powershell
+conda activate python3-9
 pip install -r requirements.txt
 python -m app.main
 ```
 
-## 上位机使用流程
+当前电脑也可直接运行：
 
-一次完整实验应作为一个“实验批次”保存。同一个传感器、同一次安装、同一套完整标定流程都放在同一个批次文件夹里；换传感器、重新安装、重新粘接或换日期实验时，再新建批次。
-
-推荐流程：
-
-```text
-1. 连接 ESP32、Mini45、Arduino。
-2. 根据安装方向设置“传感器坐标映射”。
-3. 填写实验批次/安装编号，例如 sensor01_mount01。
-4. 点击“开始实验批次”。
-5. 选择“空载零点漂移”，点击“开始标定”。
-6. 点击“自动辨识 K”，完成三轴力-位移灵敏度矩阵辨识。
-7. 选择“静态正反程标定”，加载轴选 Fz，点击“开始标定”。
-8. 选择“静态正反程标定”，加载轴选 Fx，点击“开始标定”。
-9. 选择“静态正反程标定”，加载轴选 Fy，点击“开始标定”。
-10. 选择“训练数据采集”，按需要运行不同轨迹。
-11. 全部完成后点击“结束实验批次”。
+```powershell
+.\run_app_python3_9.bat
 ```
 
-注意：
+运行测试：
 
-- `开始实验批次` 创建本次实验文件夹并打开输出文件，但不记录空闲时序数据。
-- `开始标定` 只启动当前子实验，不创建新文件夹。
-- 子实验运行时 `开始标定` 会变为 `标定运行中` 并禁用，避免重复启动同一个流程。
-- 子实验完成后不会关闭批次，可以继续切换模式做下一项。
-- `结束实验批次` 才关闭所有文件。
-- 长时间采集时 CSV 由后台写线程落盘，界面线程只负责采集、显示和控制；结束零点文件或结束实验批次时，上位机会先等待写入队列完成再关闭文件。
-- 子实验运行时实时曲线会暂停重绘，只保留数值状态、目标状态和采集保存，优先保证标定流程不卡顿。
-- 未开始实验批次时点击 `开始标定`，上位机会提示先开始实验批次。
-- `传感器坐标映射` 应在开始实验批次前设置；批次开始或 K 已辨识后会锁定，避免同一批数据混用不同坐标系。
-- `力控参数` 是实验批次级设置，固定显示在主界面中，不随实验模式切换隐藏或移动。
-- 同一批次内通常只需点击一次 `自动辨识 K`，之后单目标、静态正反程和训练数据采集都会复用当前 K。
-- 如果 Mini45 噪声较大，可启用 `Mini45上位机滤波`。推荐先使用 `截止Hz=3`、`中值点数=5`；若响应太慢可提高截止频率，若尖峰较多可保持 5 点中值滤波。
-- 点击 `清零/偏置` 后，上位机会重置 Mini45 上位机滤波、清空稳定窗口和实时力曲线，避免清零前后的数据混入 K 辨识。
-
-## 传感器坐标映射
-
-Mini45 的原始坐标不一定等于待标定传感器坐标。上位机在 Mini45 数据进入主数据流前，先按界面设置把 Mini45 原始力转换为传感器坐标力：
-
-```text
-传感器 Fx = +/- Mini45 Fx/Fy/Fz
-传感器 Fy = +/- Mini45 Fx/Fy/Fz
-传感器 Fz = +/- Mini45 Fx/Fy/Fz
+```powershell
+python -m unittest discover -s tests
+python -m compileall app tests
 ```
 
-映射必须是一一对应，不能让多个传感器轴同时选择同一个 Mini45 轴。默认映射为 `传感器 Fx=+Mini45 Fx`、`传感器 Fy=+Mini45 Fy`、`传感器 Fz=+Mini45 Fz`。
+## 设备连接
 
-设置完成后，上位机中的实时曲线、目标力、K 辨识、自动力控、稳定点和训练数据中的 `fx/fy/fz` 都表示传感器坐标。Mini45 原始值会额外保存为 `mini45_raw_*` 字段，便于后续排查。
+1. ESP32 通过 USB 串口连接电脑。
+2. Arduino 通过独立 USB 串口连接电脑。
+3. Mini45 NETBA 通过网线连接电脑，填写正确 IP、UDP 端口、力计数/单位和力矩计数/单位。
+4. 在上位机中设置 Mini45 到待测传感器的坐标映射。
+5. 开始正式实验前确认三台设备均有实时数据，电机方向和安全限位正确。
 
-## Mini45 上位机滤波
+上位机正式力控、稳定判定和标定标签均使用坐标转换后的待测传感器 `Fx/Fy/Fz`。Mini45 原始坐标数据通过 `mini45_raw_*` 字段保留。
 
-Mini45 网页低通滤波可以降低硬件输出噪声，但自动 K 辨识仍可能受到偶发尖峰或短时波动影响。上位机因此提供额外反馈滤波：
+## MC1081 采集配置
 
-- `启用`：开启后，实时显示、稳定判定、K 辨识和自动力控使用滤波后的传感器坐标力。
-- `截止Hz`：一阶低通截止频率。数值越低越平滑，但控制滞后越大；静态标定和 K 辨识可用 `2~5 Hz`。
-- `中值点数`：用于抑制单点尖峰，建议 `3` 或 `5`。点数越大，尖峰越少，但响应更慢。
-- `重置滤波`：清空滤波器历史状态。更改 Mini45 清零、重新接触或明显改变安装状态后建议重置。
+正式 ESP32 固件支持三种采集配置：
 
-注意：滤波后的力只进入上位机控制链路。`raw_timeseries.csv`、`zero_drift_timeseries_XXX.csv` 和 `training_raw_timeseries.csv` 中的 `fx/fy/fz` 仍为未滤波的传感器坐标力；`mini45_raw_*` 仍为 Mini45 原始坐标数据。
+| 配置 | CNT | CAVG | 预计频率 | 用途 |
+|---|---:|---:|---:|---|
+| `STATIC_PRECISION` | 255 | 32 | 约 2.26 Hz | 零点漂移和静态标定 |
+| `TRAINING_BALANCED` | 191 | 8 | 约 11.36 Hz | 主要训练数据 |
+| `TRAINING_FAST` | 255 | 1 | 约 50 Hz | 高速补充训练数据 |
 
-## 力控参数
+串口命令：
 
-`力控参数` 控制自动 K 辨识和解耦闭环加载速度。当前默认值偏向正式实验效率，而不是最保守的调试速度：
+```text
+PROFILE,STATIC_PRECISION
+PROFILE,TRAINING_BALANCED
+PROFILE,TRAINING_FAST
+GET_PROFILE
+START,<rate_hz>
+STOP
+CAPTURE
+INFO
+```
 
-- `δX/δY/δZ mm`：K 辨识时每个电机轴的小扰动位移，默认 `0.10 mm`。若力变化仍接近噪声，可适当增大；若接触风险较高，可降低。
-- `最大单步 mm`：自动力控单次 `MOVE_MM` 的最大位移，默认 `0.30 mm`。实验太慢时可增大，出现明显过冲时降低。
-- `最小有效步 mm`：当目标力误差还较大时，避免长期发送 `0.005 mm` 这类机械上不明显的微小位移，默认 `0.020 mm`。若加载仍然太慢，可调到 `0.030~0.050 mm`；若接近目标时容易过冲，可降到 `0.010 mm` 或 `0`。
-- `控制间隔 s`：两次自动控制指令之间的最小间隔，默认 `0.15 s`。
-- `速度 mm/s`：发送给 Arduino `MOVE_MM` 的速度，默认 `3.0 mm/s`。
-- `控制风格`：默认 `标准`。`保守` 更慢但更稳，`快速` 会更积极，适合先用小目标确认方向和安全限值后再使用。
+配置切换后，ESP32 会重新配置 MC1081，并在正式输出前丢弃前 5 个转换结果。
 
-## 实验模式
+流式 CAP 数据格式：
 
-### 空载零点漂移
+```text
+CAP,<esp_ms>,<seq>,<C0>,<C1>,<C2>,<C3>,<C4>,<profile>,<cnt>,<cavg>,<nominal_hz>
+```
 
-不控制电机，只记录空载状态下的 Mini45 和电容原始数据。
+## 推荐使用流程
 
-- 设置 `零点采集时间 s`
-- 到时间后自动结束该子实验
-- 生成 `zero_drift_timeseries_001.csv`
-- 如果同一批次内再次做零点漂移，会生成 `zero_drift_timeseries_002.csv`
+### 一键完整自动实验
 
-上位机不生成零点统计摘要。均值、标准差、漂移和峰峰值应由后续数据分析项目根据原始数据计算。
+1. 连接 ESP32、Mini45 和 Arduino。
+2. 设置传感器坐标映射、实验批次/安装编号和输出目录。
+3. 检查空载力、力矩和电机安全状态。
+4. 点击 `开始完整自动实验`。
+5. 等待完整流程结束，或使用暂停、继续、停止/急停处理异常。
 
-### 单目标点标定
+完整自动流程：
 
-输入 `target_Fx,target_Fy,target_Fz`，上位机根据 Mini45 反馈和自动辨识得到的 `K` 矩阵闭环控制三轴电机逼近目标。三向力进入容差窗口并满足稳定判据后，自动写入 marker 和稳定标定点。
+```text
+设备检查并创建实验批次
+→ STATIC_PRECISION
+→ 空载零点漂移
+→ 自动辨识 K
+→ Fz、Fx、Fy 静态正反程标定
+→ TRAINING_BALANCED 全部训练轨迹
+→ TRAINING_FAST 相同训练轨迹
+→ 自动回零
+→ 关闭实验批次
+```
 
-正式自动力控前需要先点击 `自动辨识 K`。若未完成有效 K 辨识，上位机会拒绝启动自动标定。
+自动流程运行期间，关键实验参数和实验模式会锁定，避免误操作。界面显示当前阶段、采集配置、实际频率、静态点稳定进度、`45` 帧电容采集进度以及失败/跳过数量。
 
-### 静态正反程标定
+### 手动子实验
 
-用于论文静态指标计算。
+保留原有手动子实验入口，供调试和补测使用：
 
-- `Fz` 序列默认：`0 -> 1 -> ... -> 9 -> 8 -> ... -> 0 N`
-- `Fx/Fy` 序列默认：`0 -> +3.6 -> 0` 和 `0 -> -3.6 -> 0`
-- 支持设置最大力、步长、循环次数、剪切方向
-- 输出稳定点到 `calibration_points.csv`
+- 空载零点漂移
+- 单目标点标定
+- 静态正反程标定
+- 训练数据采集
+- K 自动辨识
 
-### 训练数据采集
+手动子实验需要先点击 `开始实验批次`。
 
-用于采集深度学习训练所需的连续原始时序数据。该模式不生成训练样本，不做预处理，只保存转换后的待测传感器坐标力、Mini45 原始力、电容数据以及轨迹阶段 marker。
+## 静态标定规则
 
-训练模式不按固定时间播放目标轨迹。上位机会用转换后的传感器坐标力判断当前目标是否到达；到达后立即切换下一个目标，不做稳定保持。若当前目标超过最大等待时间仍未到达，默认自动跳过并记录超时 marker，避免单个不可达目标阻塞整段训练采集。
+完整自动流程中的静态标定固定使用：
 
-参数：
+```text
+|Fx - target_Fx| <= 0.05 N
+|Fy - target_Fy| <= 0.05 N
+|Fz - target_Fz| <= 0.08 N
+```
 
-- `Fz 层级`：例如 `3,5,7,9`
-- `轨迹类型`：`Fx往返 / Fy往返 / 斜向往返 / 随机小幅扰动`
-- `剪切最大力 N`
-- `目标步距 N`：往返和斜向轨迹中相邻目标点的力间隔
-- `训练到达窗口 N`：判断当前目标是否已被实测力覆盖
-- `最大等待时间 s`：目标长时间不可达时自动跳过，默认 60 s
-- `随机点数`：随机扰动轨迹每个 Fz 层级生成的随机目标数量，默认 30
+每个静态目标点执行：
 
-同一批次内多次运行不同训练轨迹时，数据会追加到同一组训练文件，不会覆盖。
+```text
+自动逼近目标
+→ 连续稳定保持 5 s
+→ 收集 45 个唯一、完整、有效的 STATIC_PRECISION CAP 帧
+→ 使用第 1 到第 45 个电容样本时间范围内的 Mini45 数据计算标定点
+```
+
+力离开目标窗口会清空当前点的电容样本并重新等待稳定。单点超时后最多自动重试两次，仍失败则记录无效 marker 并继续下一点。
+
+`calibration_points.csv` 同时保存原始均值、标准差和每个字段独立剔除 P01/P99 外极端值后的 `*_trimmed_mean`。后续静态指标计算优先使用 `*_trimmed_mean`。
+
+## 训练数据采集
+
+平衡频率和高速补充训练均使用相同的：
+
+- Fz 层级：`1,2,3,4,5,6,7,8,9 N`
+- 训练轨迹：Fx 往返、Fy 往返、斜向往返、随机小幅扰动
+- 目标力变化速率：`0.20 N/s`
+- 同一批次随机种子和随机目标
+
+两档训练只改变 MC1081 采集配置，用于比较采样频率与测量质量。训练文件只保存原始异步时序，不进行任何训练预处理。
 
 ## 输出文件
 
-一次实验批次文件夹示例：
+每次实验批次创建独立文件夹：
 
 ```text
-runs/
-  20260522_153000_sensor01_mount01/
-    raw_timeseries.csv
-    markers.csv
-    calibration_points.csv
-    zero_drift_timeseries_001.csv
-    training_raw_timeseries.csv
-    training_markers.csv
-    force_frame_mapping.csv
-    force_control_k.csv
-    force_control_log.csv
+runs/<日期时间_实验编号>/
+├─ raw_timeseries.csv
+├─ markers.csv
+├─ calibration_points.csv
+├─ zero_drift_timeseries_001.csv
+├─ training_balanced_raw_timeseries.csv
+├─ training_balanced_markers.csv
+├─ training_fast_raw_timeseries.csv
+├─ training_fast_markers.csv
+├─ force_control_k.csv
+├─ force_control_log.csv
+├─ force_frame_mapping.csv
+└─ workflow_events.csv
 ```
 
-### raw_timeseries.csv
+主要用途：
 
-静态标定相关原始异步时序，包括空载零点、K 辨识、Fz、Fx、Fy 等子实验。批次开始后、子实验开始前的空闲数据默认不写入该文件，避免长时间空闲采集造成文件过大和界面卡顿。
+- `raw_timeseries.csv`：静态实验相关原始异步时序。
+- `markers.csv`：静态实验事件和目标信息。
+- `calibration_points.csv`：静态标定点统计，用于论文静态指标。
+- `zero_drift_timeseries_XXX.csv`：空载零点漂移原始数据。
+- `training_balanced_*`：平衡频率训练原始数据和轨迹 marker。
+- `training_fast_*`：高速补充训练原始数据和轨迹 marker。
+- `force_control_k.csv`：K 辨识结果。
+- `force_control_log.csv`：自动力控过程。
+- `force_frame_mapping.csv`：本批次坐标映射。
+- `workflow_events.csv`：配置切换、阶段切换、重试、跳过和异常终止记录。
 
-字段：
+原始时序中的 ESP32 样本包含：
 
 ```text
-timestamp,monotonic_s,source,
-fx,fy,fz,mx,my,mz,
-mini45_raw_fx,mini45_raw_fy,mini45_raw_fz,
-mini45_raw_mx,mini45_raw_my,mini45_raw_mz,
-c0,c1,c2,c3,c4,
-mini45_sequence,mini45_status,
-esp_ms,esp_sequence
+cap_profile,mc1081_cnt,mc1081_cavg,cap_nominal_hz,cap_effective_hz
 ```
 
-Mini45 行保存转换后的传感器坐标力/力矩，同时保存 Mini45 原始力/力矩；ESP32 行保存电容，力/力矩为空。
+## 安全要求
 
-### markers.csv
+- 初次验证完整自动流程时，应使用低力、小范围、单循环参数。
+- 保持机械限位开关有效，并确保急停可用。
+- K 辨识失败、MC1081 配置验证失败、设备断开、力或力矩超限时，完整自动流程会终止并关闭已创建的数据文件。
+- 更换传感器、重新安装、重新粘接或改变坐标映射后，必须创建新批次并重新辨识 K。
 
-静态标定事件 marker，用于把 `raw_timeseries.csv` 与实验阶段对应起来。
-
-字段：
-
-```text
-timestamp,marker_id,experiment_id,cycle_id,
-branch,axis,direction,preload_N,
-target_Fx,target_Fy,target_Fz,note
-```
-
-### calibration_points.csv
-
-稳定标定点文件，用于论文静态指标和传统标定分析。每行是一个稳定窗口统计点，转换后的传感器坐标力均值是真实力标签。
-
-### zero_drift_timeseries_XXX.csv
-
-单次空载零点漂移原始时序，字段与 `raw_timeseries.csv` 一致。该文件便于后续单独分析零点稳定性，但上位机不计算统计摘要。
-
-### training_raw_timeseries.csv
-
-训练数据采集模式的原始异步时序。字段与 `raw_timeseries.csv` 一致，只保存训练采集过程。
-
-该文件不做：
-
-- 时间戳匹配
-- 插值
-- 重采样
-- 零点扣除
-- 训练预处理滤波
-- 标准化
-- 样本剔除
-
-### training_markers.csv
-
-训练轨迹阶段 marker，用于后续训练项目切分连续轨迹。
-
-常见 `note` 包括：
-
-- `training_start`
-- `fz_level_start`
-- `target_start`
-- `target_reached`
-- `target_timeout`
-- `target_skipped`
-- `recovery_start`
-- `training_end`
-
-字段：
-
-```text
-timestamp,marker_id,experiment_id,cycle_id,
-trajectory_type,phase,axis,direction,branch,
-target_Fx,target_Fy,target_Fz,
-target_shear_N,target_angle_deg,note
-```
-
-### force_frame_mapping.csv
-
-记录本批次使用的 Mini45 到传感器坐标映射。字段包括：
-
-```text
-timestamp,experiment_id,
-sensor_Fx_from,sensor_Fx_sign,
-sensor_Fy_from,sensor_Fy_sign,
-sensor_Fz_from,sensor_Fz_sign
-```
-
-### force_control_k.csv
-
-记录每次自动 `K` 矩阵辨识结果，包括扰动位移、扰动前后传感器坐标三向力均值、`K` 九个元素、奇异值、条件数、有效性和失败原因。
-
-### force_control_log.csv
-
-记录自动力控每一步的目标力、当前力、三向误差、`ΔX/ΔY/ΔZ`、脉冲量、自动阻尼、信任域比例和预测力变化。该文件用于复现实验控制过程和排查自动加载问题。
-
-## 硬件连接
-
-电脑需要同时连接：
-
-- USB 连接 ESP32：采集五通道电容
-- 网线连接 Mini45 NETBA：采集六轴力/力矩
-- USB 连接 Arduino Mega：控制三轴电机
-
-手动小步调试区域使用固定的力轴到电机轴映射，默认关系：
-
-```text
-Mini45 Fx -> Z 电机
-Mini45 Fy -> Y 电机
-Mini45 Fz -> X 电机
-```
-
-如果点击力轴正向小步后 Mini45 对应力反向变化，应优先检查 Mini45 坐标符号配置和电机方向设置。
-
-正式自动力控不使用上述单轴映射，而使用自动辨识得到的完整 `3×3` 灵敏度矩阵。矩阵列固定对应 Arduino `X/Y/Z` 电机轴，行固定对应传感器坐标 `Fx/Fy/Fz`。
-
-## ESP32 串口协议
-
-默认波特率 `115200`，可根据稳定性提高到 `921600`。
-
-命令：
-
-```text
-INFO
-CAPTURE
-START,50
-STOP
-```
-
-数据：
-
-```text
-DATA0,c0,c1,c2,c3,c4
-CAP,esp_ms,seq,c0,c1,c2,c3,c4
-L:message
-E:code,message
-```
-
-正式实验建议使用流式采集模式 `START,<rate_hz>`。
-
-## Mini45 / NETBA 配置
-
-默认参数：
-
-- NETBA IP：`192.168.1.1`
-- UDP 端口：`49152`
-- 静态标定推荐 RDT 输出频率：`100~200 Hz`
-
-Win11 网卡建议设置为同网段静态 IP，例如：
-
-```text
-IP 地址: 192.168.1.10
-子网掩码: 255.255.255.0
-网关: 可留空或 192.168.1.1
-```
-
-排查顺序：
-
-1. 浏览器打开 `http://192.168.1.1`，确认 NETBA 网页可访问。
-2. 上位机点击 `读取系数`，读取力/力矩比例系数。
-3. 若显示连接但无实时数据，检查 Windows 防火墙是否拦截 UDP。
-4. 必要时用 Wireshark 过滤 `udp.port == 49152` 查看是否有 NETBA 回包。
-
-## Arduino 三轴电机控制
-
-当前丝杆台参数：
-
-```text
-丝杆导程: 2 mm/rev
-驱动脉冲: 400 pulse/rev
-位移分辨率: 0.005 mm/pulse
-```
-
-`0.005 mm` 只是 1 个脉冲，肉眼几乎看不到，也可能被丝杆间隙或静摩擦抵消。建议首次调试使用较低目标力和较小加载范围，例如：
-
-```text
-Fz = 0.5 N
-剪切最大力 = 0.3 N
-```
-
-自动力控仍使用 Arduino 固件已有的 `MOVE_MM` 指令，不需要修改 Arduino 串口协议。
-
-## 后续数据分析建议
-
-上位机输出的是原始数据和 marker。后续项目应基于这些文件完成：
-
-- 时间戳匹配
-- Mini45 与电容同步
-- 零点扣除
-- 滤波
-- 标准化
-- 训练样本切片
-- 静态指标计算
-- 深度学习模型训练
-
-建议用途：
-
-- `calibration_points.csv`：论文静态指标、传统标定模型
-- `zero_drift_timeseries_XXX.csv`：零点漂移分析
-- `training_raw_timeseries.csv + training_markers.csv`：深度学习实时力预测模型训练
-- `force_control_k.csv + force_control_log.csv`：自动力控过程复核和论文方法说明
-
-更具体的标定控制算法和实验技术细节见 `CALIBRATION_TECHNICAL_DETAILS.md`。
-
-## 测试
-
-无硬件测试：
-
-```bash
-python -m unittest discover -s tests
-```
+具体坐标定义、K 辨识和解耦力控原理见 `CALIBRATION_TECHNICAL_DETAILS.md`。

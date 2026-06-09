@@ -62,6 +62,31 @@ class TrainingTarget:
     target_angle_deg: float | str = ""
 
 
+def advance_ramped_force_target(
+    current_target: tuple[float, float, float],
+    final_target: tuple[float, float, float],
+    measured_force: tuple[float, float, float],
+    rate_n_s: float,
+    elapsed_s: float,
+    max_lag_n: float = 0.20,
+) -> tuple[float, float, float]:
+    current = tuple(float(value) for value in current_target)
+    final = tuple(float(value) for value in final_target)
+    measured = tuple(float(value) for value in measured_force)
+    lag = math.sqrt(sum((current[index] - measured[index]) ** 2 for index in range(3)))
+    if lag > max(float(max_lag_n), 0.0):
+        return current
+    delta = tuple(final[index] - current[index] for index in range(3))
+    distance = math.sqrt(sum(value * value for value in delta))
+    if distance <= 1e-12:
+        return final
+    max_step = max(float(rate_n_s), 0.0) * max(float(elapsed_s), 0.0)
+    if max_step >= distance:
+        return final
+    scale = max_step / distance
+    return tuple(_round_force(current[index] + delta[index] * scale) for index in range(3))
+
+
 def _round_force(value: float) -> float:
     return round(float(value), 6)
 
@@ -118,6 +143,22 @@ def generate_shear_sequence(
                 targets.append(CalibrationTarget(axis, direction, "unloading", _round_force(fx), _round_force(fy), target_fz, cycle, index))
                 index += 1
     return targets
+
+
+def generate_three_axis_sequence(
+    fz_max_force: float = 9.0,
+    fz_step: float = 1.0,
+    shear_max_force: float = 3.6,
+    shear_step: float = 0.6,
+    target_fz: float = 0.0,
+    shear_direction_mode: str = "both",
+    cycles: int = 3,
+) -> list[CalibrationTarget]:
+    return (
+        generate_fz_sequence(fz_max_force, fz_step, cycles)
+        + generate_shear_sequence("Fx", shear_max_force, shear_step, target_fz, shear_direction_mode, cycles)
+        + generate_shear_sequence("Fy", shear_max_force, shear_step, target_fz, shear_direction_mode, cycles)
+    )
 
 
 def parse_force_levels(text: str) -> list[float]:

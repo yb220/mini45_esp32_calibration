@@ -33,6 +33,40 @@ def _std(values: list[float]) -> float:
     return pstdev(values) if len(values) > 1 else 0.0 if values else float("nan")
 
 
+def _percentile(values: list[float], percent: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    k = (len(ordered) - 1) * float(percent) / 100.0
+    low = math.floor(k)
+    high = math.ceil(k)
+    if low == high:
+        return ordered[low]
+    return ordered[low] * (high - k) + ordered[high] * (k - low)
+
+
+def _trimmed_mean(values: list[float], low_percent: float = 1.0, high_percent: float = 99.0) -> float:
+    if not values:
+        return float("nan")
+    low = _percentile(values, low_percent)
+    high = _percentile(values, high_percent)
+    kept = [value for value in values if low <= value <= high]
+    return _mean(kept)
+
+
+def _capacitance_stability_reasons(values: list[float], field: str, settings: StabilitySettings) -> list[str]:
+    if len(values) < 2:
+        return []
+    p95p5 = _percentile(values, 95.0) - _percentile(values, 5.0)
+    cap_std = _std(values)
+    reasons: list[str] = []
+    if p95p5 > settings.capacitance_p95p5_max_pf:
+        reasons.append(f"{field} capacitance p95-p5 too high")
+    if cap_std > settings.capacitance_std_max_pf:
+        reasons.append(f"{field} capacitance std too high")
+    return reasons
+
+
 def target_axis_field(axis: str) -> str:
     return {"Fx": "fx", "Fy": "fy", "Fz": "fz"}.get(axis, "fz")
 
@@ -111,8 +145,9 @@ def evaluate_stability(
 
     for field in CAP_FIELDS:
         values = _values(window_samples, field)
-        if len(values) >= 2 and max(values) - min(values) > settings.capacitance_jump_max_pf:
-            reasons.append(f"{field} capacitance jump too high")
+        cap_reasons = _capacitance_stability_reasons(values, field, settings)
+        if cap_reasons:
+            reasons.extend(cap_reasons)
             break
 
     return StabilityResult(
@@ -175,8 +210,9 @@ def evaluate_three_axis_stability(
 
     for field in CAP_FIELDS:
         values = _values(window_samples, field)
-        if len(values) >= 2 and max(values) - min(values) > settings.capacitance_jump_max_pf:
-            reasons.append(f"{field} capacitance jump too high")
+        cap_reasons = _capacitance_stability_reasons(values, field, settings)
+        if cap_reasons:
+            reasons.extend(cap_reasons)
             stable = False
             break
 
@@ -203,21 +239,31 @@ def build_calibration_point(
     if not samples:
         return None
 
-    def stat(field: str) -> tuple[float, float]:
+    def stat(field: str) -> tuple[float, float, float]:
         vals = _values(samples, field)
-        return _mean(vals), _std(vals)
+        return _mean(vals), _std(vals), _trimmed_mean(vals)
 
-    fx_m, fx_s = stat("fx")
-    fy_m, fy_s = stat("fy")
-    fz_m, fz_s = stat("fz")
-    mx_m, _mx_s = stat("mx")
-    my_m, _my_s = stat("my")
-    mz_m, _mz_s = stat("mz")
-    c0_m, c0_s = stat("c0")
-    c1_m, c1_s = stat("c1")
-    c2_m, c2_s = stat("c2")
-    c3_m, c3_s = stat("c3")
-    c4_m, c4_s = stat("c4")
+    fx_m, fx_s, fx_t = stat("fx")
+    fy_m, fy_s, fy_t = stat("fy")
+    fz_m, fz_s, fz_t = stat("fz")
+    mx_m, _mx_s, mx_t = stat("mx")
+    my_m, _my_s, my_t = stat("my")
+    mz_m, _mz_s, mz_t = stat("mz")
+    c0_m, c0_s, c0_t = stat("c0")
+    c1_m, c1_s, c1_t = stat("c1")
+    c2_m, c2_s, c2_t = stat("c2")
+    c3_m, c3_s, c3_t = stat("c3")
+    c4_m, c4_s, c4_t = stat("c4")
+    force_sample_count = sum(
+        1
+        for sample in samples
+        if all(getattr(sample, field) is not None for field in FORCE_FIELDS)
+    )
+    cap_sample_count = sum(
+        1
+        for sample in samples
+        if all(getattr(sample, field) is not None for field in CAP_FIELDS)
+    )
 
     return CalibrationPoint(
         timestamp_start=samples[0].timestamp,
@@ -254,4 +300,17 @@ def build_calibration_point(
         valid=valid,
         reject_reason=reject_reason,
         note=meta.note,
+        Fx_trimmed_mean=fx_t,
+        Fy_trimmed_mean=fy_t,
+        Fz_trimmed_mean=fz_t,
+        Mx_trimmed_mean=mx_t,
+        My_trimmed_mean=my_t,
+        Mz_trimmed_mean=mz_t,
+        C0_trimmed_mean=c0_t,
+        C1_trimmed_mean=c1_t,
+        C2_trimmed_mean=c2_t,
+        C3_trimmed_mean=c3_t,
+        C4_trimmed_mean=c4_t,
+        cap_sample_count=cap_sample_count,
+        force_sample_count=force_sample_count,
     )

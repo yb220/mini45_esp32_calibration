@@ -6,7 +6,7 @@
 #define I2C_SDA_PIN 4
 #define I2C_SCL_PIN 5
 #define I2C_FREQ_HZ 100000
-#define FIRMWARE_VERSION "mini45_calibration_mc1081_v1"
+#define FIRMWARE_VERSION "mini45_calibration_mc1081_v2_profiles"
 
 MC1081_InitStructure init_struct;
 CAP_AFE_DoubleEnded cap_data;
@@ -15,6 +15,40 @@ bool streaming = false;
 uint32_t stream_period_ms = 20;
 uint32_t last_stream_ms = 0;
 uint32_t sequence_id = 0;
+String active_profile = "TRAINING_FAST";
+uint8_t active_cavg_count = 1;
+float active_nominal_hz = 50.0f;
+
+bool configure_profile(const String &name) {
+  if (name == "STATIC_PRECISION") {
+    init_struct.MC1081_CNT_CFG = 255;
+    init_struct.MC1081_CAVG = CAVG_32;
+    active_cavg_count = 32;
+    active_nominal_hz = 2.262325f;
+  } else if (name == "TRAINING_BALANCED") {
+    init_struct.MC1081_CNT_CFG = 191;
+    init_struct.MC1081_CAVG = CAVG_8;
+    active_cavg_count = 8;
+    active_nominal_hz = 11.363636f;
+  } else if (name == "TRAINING_FAST") {
+    init_struct.MC1081_CNT_CFG = 255;
+    init_struct.MC1081_CAVG = CAVG_1;
+    active_cavg_count = 1;
+    active_nominal_hz = 50.0f;
+  } else {
+    return false;
+  }
+  active_profile = name;
+  return true;
+}
+
+void print_profile() {
+  Serial.printf("L:PROFILE,%s,cnt=%u,cavg=%u,nominal_hz=%.6f\n",
+                active_profile.c_str(),
+                init_struct.MC1081_CNT_CFG,
+                active_cavg_count,
+                active_nominal_hz);
+}
 
 void setup_mc1081() {
   init_struct.MC1081_OSC_MODE = OSC2;
@@ -24,7 +58,7 @@ void setup_mc1081() {
   init_struct.MC1081_DRIVEI = DRIVE_I_8UA;
   init_struct.MC1081_OSC2_CHANNEL =
       OSC2_Channel_0 | OSC2_Channel_1 | OSC2_Channel_2 | OSC2_Channel_3 | OSC2_Channel_4 | OSC2_Ref_Channel;
-  init_struct.MC1081_CNT_CFG = 0x7F;
+  configure_profile(active_profile);
   init_struct.MC1081_SHLD_CFG = SHLD_DIS;
 
   if (Registers_Init(&init_struct)) {
@@ -32,6 +66,22 @@ void setup_mc1081() {
   } else {
     Serial.println("E:INIT,MC1081 initialization failed");
   }
+}
+
+bool apply_profile(const String &name) {
+  bool was_streaming = streaming;
+  streaming = false;
+  if (!configure_profile(name)) return false;
+  setup_mc1081();
+
+  // 配置切换后的前五次转换仅用于稳定芯片内部状态，不输出到正式数据流。
+  float discarded[5];
+  for (int i = 0; i < 5; i++) {
+    if (!read_capacitance(discarded)) return false;
+  }
+  streaming = was_streaming;
+  last_stream_ms = 0;
+  return true;
 }
 
 bool read_capacitance(float out[5]) {
@@ -62,10 +112,14 @@ void print_cap_frame() {
     return;
   }
   sequence_id++;
-  Serial.printf("CAP,%lu,%lu,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+  Serial.printf("CAP,%lu,%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%s,%u,%u,%.6f\n",
                 (unsigned long)millis(),
                 (unsigned long)sequence_id,
-                values[0], values[1], values[2], values[3], values[4]);
+                values[0], values[1], values[2], values[3], values[4],
+                active_profile.c_str(),
+                init_struct.MC1081_CNT_CFG,
+                active_cavg_count,
+                active_nominal_hz);
 }
 
 void handle_command(String command) {
@@ -75,6 +129,22 @@ void handle_command(String command) {
 
   if (command == "INFO") {
     Serial.printf("L:%s,baud=%d,sda=%d,scl=%d\n", FIRMWARE_VERSION, SERIAL_BAUD, I2C_SDA_PIN, I2C_SCL_PIN);
+    print_profile();
+    return;
+  }
+
+  if (command == "GET_PROFILE") {
+    print_profile();
+    return;
+  }
+
+  if (command.startsWith("PROFILE,")) {
+    String name = command.substring(8);
+    if (!apply_profile(name)) {
+      Serial.printf("E:PROFILE,failed:%s\n", name.c_str());
+      return;
+    }
+    print_profile();
     return;
   }
 

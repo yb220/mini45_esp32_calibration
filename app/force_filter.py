@@ -11,8 +11,8 @@ from .models import ForceSample
 @dataclass
 class ForceFilterSettings:
     enabled: bool = True
-    cutoff_hz: float = 3.0
-    median_window: int = 5
+    cutoff_hz: float = 1.5
+    median_window: int = 7
 
 
 class ForceLowPassFilter:

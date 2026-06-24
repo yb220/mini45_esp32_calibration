@@ -19,6 +19,8 @@ CMD_STOP = 0x0000
 CMD_START_REALTIME = 0x0002
 CMD_START_BUFFERED = 0x0003
 CMD_BIAS = 0x0042
+DEFAULT_RDT_RATE_HZ = 200.0
+SEQUENCE_MODULUS = 1 << 32
 
 
 @dataclass
@@ -43,6 +45,67 @@ def fetch_netft_config(ip: str, timeout_s: float = 2.0) -> dict[str, str]:
 
 def build_rdt_command(command: int, count: int = 0) -> bytes:
     return struct.pack("!HHI", RDT_MAGIC, command, count)
+
+
+def _signed_sequence_delta(sequence: int, reference: int) -> int:
+    """带符号的 32-bit 序列号差值，正确处理回绕。"""
+    delta = (sequence - reference) & 0xFFFFFFFF
+    if delta >= SEQUENCE_MODULUS // 2:
+        delta -= SEQUENCE_MODULUS
+    return delta
+
+
+class RdtTimestampReconstructor:
+    """基于 RDT 序列号重建精确样本时间戳，消除 UDP 到达抖动。
+
+    Mini45 以固定周期（默认 200 Hz = 5 ms）生成样本，RDT 序列号严格递增。
+    用序列号差值推算样本时刻，避免 UDP 包到达的 OS 调度抖动污染时间轴。
+    同时对 PC 时钟做缓慢跟踪（10% 修正率，上限 20% 采样周期），
+    防止名义频率误差累积。
+    """
+
+    def __init__(self, sample_rate_hz: float = DEFAULT_RDT_RATE_HZ):
+        self.sample_period_s = 1.0 / sample_rate_hz
+        self.last_sequence: int | None = None
+        self.last_t_s: float | None = None
+
+    def reset(self) -> None:
+        self.last_sequence = None
+        self.last_t_s = None
+
+    def apply(
+        self, samples: list[ForceSample], packet_t_s: float
+    ) -> list[ForceSample]:
+        sequenced = [s for s in samples if s.sequence is not None]
+        if not sequenced:
+            return samples
+
+        newest = sequenced[-1]
+        newest_sequence = int(newest.sequence)
+        if self.last_sequence is None or self.last_t_s is None:
+            newest_t_s = packet_t_s
+        else:
+            seq_delta = _signed_sequence_delta(newest_sequence, self.last_sequence)
+            expected_t_s = self.last_t_s + seq_delta * self.sample_period_s
+            arrival_error_s = packet_t_s - expected_t_s
+            if seq_delta <= 0 or abs(arrival_error_s) > 1.0:
+                # 流重启或长时间中断：重新锚定 PC 时钟
+                newest_t_s = packet_t_s
+            else:
+                # 缓慢跟踪 PC 时钟，上限 20% 采样周期
+                correction_limit_s = self.sample_period_s * 0.2
+                correction_s = max(
+                    -correction_limit_s,
+                    min(correction_limit_s, arrival_error_s * 0.1),
+                )
+                newest_t_s = expected_t_s + correction_s
+
+        for sample in sequenced:
+            delta = _signed_sequence_delta(int(sample.sequence), newest_sequence)
+            sample.monotonic_s = newest_t_s + delta * self.sample_period_s
+        self.last_sequence = newest_sequence
+        self.last_t_s = newest_t_s
+        return samples
 
 
 def parse_rdt_packet(
@@ -130,6 +193,7 @@ class Mini45NetFTAdapter:
         self._last_status: int | None = None
         self._sequence_gap_count = 0
         self._last_sequence_warning_s = 0.0
+        self._timestamps = RdtTimestampReconstructor()
 
     def _put_output(self, item: ForceSample | Mini45Log) -> None:
         try:
@@ -157,6 +221,7 @@ class Mini45NetFTAdapter:
         self._last_status = None
         self._sequence_gap_count = 0
         self._last_sequence_warning_s = 0.0
+        self._timestamps.reset()
         self._put_output(
             Mini45Log(
                 "info",
@@ -190,14 +255,14 @@ class Mini45NetFTAdapter:
         while not self._stop.is_set():
             try:
                 data, _addr = self._socket.recvfrom(2048)
-                now = time.monotonic()
-                self._last_packet_time = now
+                packet_t = time.monotonic()
+                self._last_packet_time = packet_t
                 if not self._first_packet_seen:
                     self._first_packet_seen = True
                     self._put_output(Mini45Log("info", f"已收到第一帧 RDT UDP 数据，包长 {len(data)} 字节，来源 {_addr[0]}:{_addr[1]}"))
                 samples = parse_rdt_packet(
                     data,
-                    monotonic_s=now,
+                    monotonic_s=packet_t,
                     force_counts_per_unit=self.force_counts_per_unit,
                     torque_counts_per_unit=self.torque_counts_per_unit,
                     force_signs=self.force_signs,
@@ -205,6 +270,8 @@ class Mini45NetFTAdapter:
                 )
                 if not samples:
                     self._put_output(Mini45Log("error", f"RDT 数据包长度异常：{len(data)} 字节，应为 36 字节的整数倍"))
+                # 用 RDT 序列号重建每个样本的精确时间戳，消除 UDP 到达抖动
+                self._timestamps.apply(samples, packet_t)
                 for sample in samples:
                     if self._last_sequence is not None and sample.sequence is not None:
                         expected = (self._last_sequence + 1) & 0xFFFFFFFF

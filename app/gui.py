@@ -82,7 +82,6 @@ from .mini45_netft import Mini45Log, Mini45NetFTAdapter, Mini45Simulator, fetch_
 from .mini45_precomp import (
     ZERO_BIAS,
     compute_precomp_summary,
-    full_workflow_precomp_ready,
     save_precomp_summary,
     subtract_precomp_bias,
 )
@@ -451,12 +450,14 @@ class MainWindow(QMainWindow):
         self.k_condition_limit = self._spin(10.0, 1000.0, 300.0)
         self.force_filter_enabled = QCheckBox("启用")
         self.force_filter_enabled.setChecked(True)
-        self.force_filter_cutoff_hz = self._spin(0.1, 30.0, 3.0)
+        self.force_filter_cutoff_hz = self._spin(0.1, 30.0, 1.5)
         self.force_filter_cutoff_hz.setSingleStep(0.5)
+        self.force_filter_cutoff_hz.setToolTip("截止频率越低越平滑，静态标定推荐 1.5 Hz")
         self.force_filter_median_points = QSpinBox()
         self.force_filter_median_points.setRange(1, 9)
         self.force_filter_median_points.setSingleStep(2)
-        self.force_filter_median_points.setValue(5)
+        self.force_filter_median_points.setValue(7)
+        self.force_filter_median_points.setToolTip("中值窗口越大抗脉冲越强，推荐 5~9 点")
         self.force_filter_reset_btn = QPushButton("重置滤波")
         self.force_filter_reset_btn.clicked.connect(self.reset_force_filter)
         self.control_style = QComboBox()
@@ -1516,11 +1517,6 @@ class MainWindow(QMainWindow):
         return abs(self.current_cap_effective_hz - nominal) / nominal <= 0.20
 
     def start_full_workflow(self) -> None:
-        if not full_workflow_precomp_ready(self.mini45_precomp_enabled):
-            message = "请先完成 Mini45 预补偿 60s，再开始完整标定流程。"
-            QMessageBox.warning(self, "完整自动实验", message)
-            self._log(message)
-            return
         if self.workflow.active or self._calibration_active() or self.k_ident_active:
             QMessageBox.warning(self, "完整自动实验", "当前已有实验流程正在运行")
             return
@@ -1619,6 +1615,10 @@ class MainWindow(QMainWindow):
             self._request_cap_profile(STATIC_PRECISION.name)
         elif stage == "zero_drift":
             self.calibration_mode = "zero"
+            # 硬件 CMD_BIAS：发送 ATI 清零命令，NETBA 内部归零六轴输出
+            if self.mini45 and hasattr(self.mini45, "bias"):
+                self.mini45.bias()
+                self._log("已发送 Mini45 硬件清零命令（CMD_BIAS），零漂采集将以归零后数据记录")
             self.start_zero_drift()
         elif stage == "k_identification":
             self.start_k_identification()

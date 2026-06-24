@@ -26,7 +26,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -186,24 +188,46 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        conn = QHBoxLayout()
-        conn.addWidget(self._build_esp32_group(), stretch=1)
-        conn.addWidget(self._build_mini45_group(), stretch=1)
-        conn.addWidget(self._build_motion_group(), stretch=1)
-        layout.addLayout(conn)
+        tabs = QTabWidget()
+        layout.addWidget(tabs, stretch=3)
 
-        layout.addWidget(self._build_force_frame_group())
-        layout.addWidget(self._build_force_control_group())
-        layout.addWidget(self._build_workflow_group())
-        layout.addWidget(self._build_calibration_group())
+        device_page, device_layout = self._tab_page()
+        device_layout.addWidget(self._build_esp32_group())
+        device_layout.addWidget(self._build_mini45_group())
+        device_layout.addWidget(self._build_motion_group())
+        device_layout.addStretch(1)
+        tabs.addTab(device_page, "设备连接")
 
-        status_plots = QHBoxLayout()
-        status_plots.addWidget(self._build_status_group(), stretch=1)
-        status_plots.addWidget(self._build_record_group(), stretch=1)
-        layout.addLayout(status_plots)
+        experiment_page, experiment_layout = self._tab_page()
+        experiment_layout.addWidget(self._build_force_frame_group())
+        experiment_layout.addWidget(self._build_force_control_group())
+        experiment_layout.addWidget(self._build_record_group())
+        experiment_layout.addStretch(1)
+        tabs.addTab(experiment_page, "实验配置")
+
+        workflow_page, workflow_layout = self._tab_page()
+        workflow_layout.addWidget(self._build_workflow_group())
+        workflow_layout.addStretch(1)
+        tabs.addTab(workflow_page, "完整流程")
+
+        calibration_page, calibration_layout = self._tab_page()
+        calibration_layout.addWidget(self._build_calibration_group())
+        calibration_layout.addStretch(1)
+        tabs.addTab(calibration_page, "标定与训练")
+
+        monitor_layout = QHBoxLayout()
+        monitor_sidebar = QVBoxLayout()
+        monitor_sidebar.addWidget(self._build_status_group())
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("运行日志")
+        self.log.document().setMaximumBlockCount(1000)
+        monitor_sidebar.addWidget(self.log, stretch=1)
+        monitor_layout.addLayout(monitor_sidebar, stretch=1)
 
         plot_layout = QHBoxLayout()
-        self.force_plot = pg.PlotWidget(title="传感器坐标力数据")
+        self.force_plot = pg.PlotWidget(title="Mini45 力数据（传感器坐标）")
         self.force_plot.setBackground("w")
         self.force_plot.addLegend()
         self.force_curves = {
@@ -221,12 +245,16 @@ class MainWindow(QMainWindow):
         }
         plot_layout.addWidget(self.force_plot)
         plot_layout.addWidget(self.cap_plot)
-        layout.addLayout(plot_layout, stretch=1)
+        monitor_layout.addLayout(plot_layout, stretch=3)
+        layout.addLayout(monitor_layout, stretch=2)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.document().setMaximumBlockCount(1000)
-        layout.addWidget(self.log)
+    def _tab_page(self) -> tuple[QScrollArea, QVBoxLayout]:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        return scroll, layout
 
     def _build_esp32_group(self) -> QGroupBox:
         box = QGroupBox("ESP32 / MC1081 电容采集")

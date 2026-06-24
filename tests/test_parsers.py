@@ -46,7 +46,7 @@ class ParserTests(unittest.TestCase):
 
     def test_parse_rdt_packet_36_bytes(self):
         packet = struct.pack("!IIIiiiiii", 1, 2, 0, 1000000, -2000000, 3000000, 1000, -2000, 3000)
-        samples = parse_rdt_packet(packet, monotonic_s=1.0, torque_counts_per_unit=1000.0)
+        samples = parse_rdt_packet(packet, monotonic_s=1.0, force_counts_per_unit=1_000_000.0, torque_counts_per_unit=1000.0)
         self.assertEqual(len(samples), 1)
         sample = samples[0]
         self.assertEqual(sample.sequence, 1)

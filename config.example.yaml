@@ -8,8 +8,9 @@ mini45:
   ip: 192.168.1.1
   port: 49152
   rate_hz: 200
-  force_counts_per_unit: 1000000
-  torque_counts_per_unit: 1000000
+  # force_counts_per_unit / torque_counts_per_unit 已废弃
+  # 现在连接时自动从 NETBA netftapi2.xml 读取 cfgcpf / cfgcpt
+  # SI-145-5 典型值：force ≈53 counts/N，torque ≈3610 counts/Nm
   force_signs: [1, 1, 1]
   torque_signs: [1, 1, 1]
 

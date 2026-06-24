@@ -79,6 +79,13 @@ from .force_control import (
     identify_k_matrix,
 )
 from .mini45_netft import Mini45Log, Mini45NetFTAdapter, Mini45Simulator, fetch_netft_config
+from .mini45_precomp import (
+    ZERO_BIAS,
+    compute_precomp_summary,
+    full_workflow_precomp_ready,
+    save_precomp_summary,
+    subtract_precomp_bias,
+)
 from .models import (
     CapSample,
     CombinedSnapshot,
@@ -86,6 +93,7 @@ from .models import (
     ForceSample,
     SafetySettings,
     StabilitySettings,
+    utc_timestamp,
 )
 from .recorder import CsvRecorder
 from .stability import build_calibration_point, evaluate_three_axis_stability
@@ -109,6 +117,15 @@ class MainWindow(QMainWindow):
         self.last_cap_time = 0.0
         self.latest_force_sample: ForceSample | None = None
         self.force_filter = ForceLowPassFilter()
+        self.mini45_precomp_active: bool = False
+        self.mini45_precomp_enabled: bool = False
+        self.mini45_precomp_samples: list[ForceSample] = []
+        self.mini45_precomp_bias: dict[str, float] = dict(ZERO_BIAS)
+        self.mini45_precomp_start_monotonic_s: float | None = None
+        self.mini45_precomp_duration_s: float = 60.0
+        self.mini45_precomp_quality: str = "none"
+        self._mini45_cfgcpf: float | None = None
+        self._mini45_cfgcpt: float | None = None
         self.motion_positions = {"X": None, "Y": None, "Z": None}
         self.auto_force_active = False
         self.auto_force_holding = False
@@ -297,27 +314,24 @@ class MainWindow(QMainWindow):
         self.mini_port.setRange(1, 65535)
         self.mini_port.setValue(49152)
         form.addRow("UDP 端口", self.mini_port)
-        self.force_scale = QDoubleSpinBox()
-        self.force_scale.setRange(1.0, 1_000_000_000.0)
-        self.force_scale.setDecimals(0)
-        self.force_scale.setValue(1_000_000.0)
-        form.addRow("力计数/单位", self.force_scale)
-        self.torque_scale = QDoubleSpinBox()
-        self.torque_scale.setRange(1.0, 1_000_000_000.0)
-        self.torque_scale.setDecimals(0)
-        self.torque_scale.setValue(1_000_000.0)
-        form.addRow("力矩计数/单位", self.torque_scale)
+        self.force_scale_label = QLabel("—")
+        form.addRow("力计数/单位（自动读取）", self.force_scale_label)
+        self.torque_scale_label = QLabel("—")
+        form.addRow("力矩计数/单位（自动读取）", self.torque_scale_label)
         btns = QHBoxLayout()
         self.mini_btn = QPushButton("连接 Mini45")
         self.mini_btn.clicked.connect(self.toggle_mini45)
         self.bias_btn = QPushButton("清零/偏置")
         self.bias_btn.clicked.connect(self.bias_mini45)
-        self.read_scale_btn = QPushButton("读取系数")
-        self.read_scale_btn.clicked.connect(self.read_mini45_scales)
         btns.addWidget(self.mini_btn)
         btns.addWidget(self.bias_btn)
-        btns.addWidget(self.read_scale_btn)
         form.addRow(btns)
+        self.mini45_precomp_btn = QPushButton("Mini45 预补偿 60s")
+        self.mini45_precomp_btn.clicked.connect(self.start_mini45_precomp)
+        form.addRow(self.mini45_precomp_btn)
+        self.mini45_precomp_status = QLabel("预补偿：未补偿")
+        self.mini45_precomp_status.setWordWrap(True)
+        form.addRow(self.mini45_precomp_status)
         self.mini_status = QLabel("Mini45 状态：未连接")
         form.addRow(self.mini_status)
         return box
@@ -787,7 +801,8 @@ class MainWindow(QMainWindow):
 
     def _calibration_active(self) -> bool:
         return bool(
-            self.zero_drift_active
+            self.mini45_precomp_active
+            or self.zero_drift_active
             or self.training_active
             or self.auto_force_active
             or self.auto_force_holding
@@ -836,6 +851,10 @@ class MainWindow(QMainWindow):
 
     def toggle_mini45(self) -> None:
         if self.mini45:
+            if self.mini45_precomp_active:
+                self.finish_mini45_precomp("Mini45 已断开")
+            elif self.mini45_precomp_enabled:
+                self._invalidate_mini45_precomp("Mini45 已断开，预补偿已失效")
             self.mini45.stop()
             self.mini45 = None
             self.last_force_time = 0.0
@@ -849,13 +868,58 @@ class MainWindow(QMainWindow):
             mini_mode = self._combo_value(self.mini_mode)
             if mini_mode == "simulator":
                 self.mini45 = Mini45Simulator(rate_hz=100)
+                self.force_scale_label.setText("—")
+                self.torque_scale_label.setText("—")
+                self._mini45_cfgcpf = None
+                self._mini45_cfgcpt = None
             else:
+                ip = self.mini_ip.text().strip()
+                if not ip:
+                    QMessageBox.critical(self, "Mini45", "请填写 NETBA IP 地址")
+                    return
+                # 强制从 NETBA 自动读取校准系数
+                try:
+                    config = fetch_netft_config(ip)
+                except Exception as fetch_exc:
+                    QMessageBox.critical(
+                        self, "Mini45",
+                        f"无法从 NETBA 读取校准系数（cfgcpf/cfgcpt），请检查 NETBA 网络连接。\n\n"
+                        f"错误详情：{fetch_exc}\n\n"
+                        f"Mini45 需要 NETBA 盒提供 counts-per-unit 校准值才能正确转换力/力矩单位。"
+                    )
+                    return
+                cfgcpf_str = config.get("cfgcpf")
+                cfgcpt_str = config.get("cfgcpt")
+                if not cfgcpf_str or not cfgcpt_str:
+                    QMessageBox.critical(
+                        self, "Mini45",
+                        f"NETBA 返回的配置中缺少校准系数。\n"
+                        f"cfgcpf={cfgcpf_str or '缺失'}，cfgcpt={cfgcpt_str or '缺失'}\n\n"
+                        f"请确认 NETBA 已正确配置 Mini45 传感器的校准参数。"
+                    )
+                    return
+                force_cpu = float(cfgcpf_str)
+                torque_cpu = float(cfgcpt_str)
+                self._mini45_cfgcpf = force_cpu
+                self._mini45_cfgcpt = torque_cpu
+                self.force_scale_label.setText(f"{force_cpu:g}")
+                self.torque_scale_label.setText(f"{torque_cpu:g}")
+                force_unit = config.get("scfgfu", "")
+                torque_unit = config.get("scfgtu", "")
+                rdt_rate = config.get("comrdtrate", "")
+                self._log(
+                    f"已从 netftapi2.xml 自动读取校准系数："
+                    f"cfgcpf={cfgcpf_str}，cfgcpt={cfgcpt_str}"
+                    f"{'，力单位 ' + force_unit if force_unit else ''}"
+                    f"{'，力矩单位 ' + torque_unit if torque_unit else ''}"
+                    f"{'，RDT 频率 ' + rdt_rate + ' Hz' if rdt_rate else ''}"
+                )
                 self.mini45 = Mini45NetFTAdapter(
-                    ip=self.mini_ip.text().strip(),
+                    ip=ip,
                     port=self.mini_port.value(),
-                    force_counts_per_unit=self.force_scale.value(),
-                    torque_counts_per_unit=self.torque_scale.value(),
-            )
+                    force_counts_per_unit=force_cpu,
+                    torque_counts_per_unit=torque_cpu,
+                )
             self.last_force_time = 0.0
             self.latest_force_sample = None
             self.reset_force_filter(log=False)
@@ -871,44 +935,131 @@ class MainWindow(QMainWindow):
             self.mini45 = None
             QMessageBox.critical(self, "Mini45", str(exc))
 
-    def read_mini45_scales(self) -> None:
-        ip = self.mini_ip.text().strip()
-        if not ip:
-            QMessageBox.warning(self, "Mini45", "请先填写 NETBA IP 地址")
-            return
-        try:
-            config = fetch_netft_config(ip)
-            if "cfgcpf" in config:
-                self.force_scale.setValue(float(config["cfgcpf"]))
-            if "cfgcpt" in config:
-                self.torque_scale.setValue(float(config["cfgcpt"]))
-            force_unit = config.get("scfgfu", "")
-            torque_unit = config.get("scfgtu", "")
-            rdt_rate = config.get("comrdtrate", "")
-            rdt_enabled = config.get("comrdte", "")
-            details = []
-            if force_unit:
-                details.append(f"力单位 {force_unit}")
-            if torque_unit:
-                details.append(f"力矩单位 {torque_unit}")
-            if rdt_rate:
-                details.append(f"RDT 频率 {rdt_rate} Hz")
-            if rdt_enabled:
-                details.append(f"RDT 启用状态 {rdt_enabled}")
-            self._log(f"已从 netftapi2.xml 读取系数：cfgcpf={config.get('cfgcpf', '未知')}，cfgcpt={config.get('cfgcpt', '未知')}；{'，'.join(details)}")
-        except Exception as exc:
-            QMessageBox.warning(self, "Mini45", f"读取 NETBA 系数失败：{exc}")
-
     def bias_mini45(self) -> None:
-        if self.auto_force_active or self.k_ident_active or self.zero_drift_active or self.training_active:
-            QMessageBox.warning(self, "Mini45", "自动标定、K 辨识、零点漂移或训练采集过程中不能清零/偏置")
+        if self.mini45_precomp_active or self.auto_force_active or self.k_ident_active or self.zero_drift_active or self.training_active:
+            QMessageBox.warning(self, "Mini45", "预补偿、自动标定、K 辨识、零点漂移或训练采集过程中不能清零/偏置")
             return
         if self.mini45 and hasattr(self.mini45, "bias"):
             self.mini45.bias()
+            if self.mini45_precomp_enabled:
+                self._invalidate_mini45_precomp("Mini45 硬件清零后原预补偿已失效")
             self.reset_force_filter(log=False)
             self.buffer.clear()
             self._clear_force_plot()
             self._log("Mini45 清零/偏置命令已发送，已重置上位机滤波、稳定窗口和力曲线")
+
+    def start_mini45_precomp(self) -> None:
+        if self.mini45_precomp_active:
+            return
+        if self.workflow.active or self._calibration_active() or self.k_ident_active:
+            QMessageBox.warning(self, "Mini45 预补偿", "当前有实验、力控或 K 辨识正在运行")
+            return
+        now = time.monotonic()
+        if not self.mini45 or self.last_force_time <= 0.0 or now - self.last_force_time > 1.0:
+            QMessageBox.warning(self, "Mini45 预补偿", "请先连接 Mini45，并确认最近 1 秒内有实时数据")
+            return
+        try:
+            self.current_force_frame_mapping().validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Mini45 预补偿", f"请先修正传感器坐标映射：{exc}")
+            return
+
+        self.mini45_precomp_samples.clear()
+        self.mini45_precomp_active = True
+        self.mini45_precomp_enabled = False
+        self.mini45_precomp_bias = dict(ZERO_BIAS)
+        self.mini45_precomp_start_monotonic_s = now
+        self.mini45_precomp_quality = "none"
+        self.reset_force_filter(log=False)
+        self.buffer.clear()
+        self._clear_force_plot()
+        self.clear_force_control_k()
+        self._update_force_frame_mapping_lock()
+        self.mini45_precomp_btn.setEnabled(False)
+        self.mini45_precomp_status.setText(f"预补偿：测量中 0.0/{self.mini45_precomp_duration_s:.0f} s")
+        self._update_calibration_buttons()
+        self._log(
+            "开始 Mini45 预补偿 60s：请确保 Mini45 空载、加载头不接触传感器、机械完全静止。"
+            "本流程不会补偿 ESP32 电容数据。"
+        )
+
+    def _mini45_precomp_summary_path(self) -> Path:
+        if self.recorder:
+            output_dir = self.recorder.output_dir
+        else:
+            output_dir = Path(self.output_dir.text()) / "precomp"
+        return output_dir / f"mini45_precomp_summary_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+
+    def _mini45_precomp_bias_text(self, bias: dict[str, float]) -> str:
+        return ", ".join(f"{field.upper()}={bias[field]:+.6g}" for field in ("fx", "fy", "fz", "mx", "my", "mz"))
+
+    def finish_mini45_precomp(self, forced_failure_reason: str = "") -> None:
+        if not self.mini45_precomp_active or self.mini45_precomp_start_monotonic_s is None:
+            return
+        end_s = time.monotonic()
+        summary = compute_precomp_summary(
+            self.mini45_precomp_samples,
+            measurement_start_s=self.mini45_precomp_start_monotonic_s,
+            measurement_end_s=end_s,
+            timestamp=utc_timestamp(),
+        )
+        if forced_failure_reason:
+            summary["quality"] = "fail"
+            existing_reason = str(summary.get("reject_reason", ""))
+            summary["reject_reason"] = "；".join(reason for reason in (existing_reason, forced_failure_reason) if reason)
+
+        self.mini45_precomp_active = False
+        self.mini45_precomp_start_monotonic_s = None
+        self.mini45_precomp_quality = str(summary["quality"])
+        self.mini45_precomp_enabled = self.mini45_precomp_quality != "fail"
+        if self.mini45_precomp_enabled:
+            self.mini45_precomp_bias = {
+                field: float(summary[f"bias_{field}"])
+                for field in ("fx", "fy", "fz", "mx", "my", "mz")
+            }
+        else:
+            self.mini45_precomp_bias = dict(ZERO_BIAS)
+
+        self.reset_force_filter(log=False)
+        self.buffer.clear()
+        self._clear_force_plot()
+        self.clear_force_control_k()
+        self._update_force_frame_mapping_lock()
+        self.mini45_precomp_btn.setEnabled(True)
+        self._update_calibration_buttons()
+
+        try:
+            summary_path = self._mini45_precomp_summary_path()
+            save_precomp_summary(summary, summary_path)
+            self._log(f"Mini45 预补偿 summary 已保存：{summary_path}")
+        except Exception as exc:
+            self._log(f"Mini45 预补偿 summary 保存失败（不影响质量判定）：{exc}")
+
+        if self.mini45_precomp_enabled:
+            bias_text = self._mini45_precomp_bias_text(self.mini45_precomp_bias)
+            quality_text = "通过" if self.mini45_precomp_quality == "pass" else "警告"
+            self.mini45_precomp_status.setText(f"预补偿：已启用（{quality_text}）\n{bias_text}")
+            self._log(f"Mini45 预补偿已启用（{quality_text}）：{bias_text}")
+            if summary.get("reject_reason"):
+                self._log(f"Mini45 预补偿质量提示：{summary['reject_reason']}")
+        else:
+            reason = str(summary.get("reject_reason") or "质量检查未通过")
+            self.mini45_precomp_status.setText(f"预补偿：失败，{reason}")
+            self._log(f"Mini45 预补偿失败：{reason}。请保持空载静止后重新测量。")
+
+    def _invalidate_mini45_precomp(self, reason: str) -> None:
+        self.mini45_precomp_active = False
+        self.mini45_precomp_enabled = False
+        self.mini45_precomp_bias = dict(ZERO_BIAS)
+        self.mini45_precomp_start_monotonic_s = None
+        self.mini45_precomp_quality = "fail"
+        self.reset_force_filter(log=False)
+        self.buffer.clear()
+        if hasattr(self, "mini45_precomp_btn"):
+            self.mini45_precomp_btn.setEnabled(True)
+            self.mini45_precomp_status.setText(f"预补偿：失败，{reason}")
+        self._update_force_frame_mapping_lock()
+        self._log(reason)
 
     def _force_filter_settings(self) -> ForceFilterSettings:
         return ForceFilterSettings(
@@ -1063,6 +1214,8 @@ class MainWindow(QMainWindow):
             f"Fy={mapping.sensor_fy.sign:+d} Mini45 {mapping.sensor_fy.source_axis}，"
             f"Fz={mapping.sensor_fz.sign:+d} Mini45 {mapping.sensor_fz.source_axis}"
         )
+        if self.mini45_precomp_enabled:
+            self._invalidate_mini45_precomp("传感器坐标映射已修改，Mini45 预补偿已失效，请重新测量 60s")
         if self.force_control_result:
             self.clear_force_control_k()
             self._log("坐标映射已修改，当前 K 已清除，需要重新自动辨识")
@@ -1072,7 +1225,7 @@ class MainWindow(QMainWindow):
             combo.setEnabled(enabled)
 
     def _update_force_frame_mapping_lock(self) -> None:
-        locked = bool(self.recorder or self.k_ident_active or self.force_control_result)
+        locked = bool(self.recorder or self.k_ident_active or self.force_control_result or self.mini45_precomp_active)
         self._set_force_frame_mapping_enabled(not locked)
 
     def k_delta_values(self) -> dict[str, float]:
@@ -1363,6 +1516,11 @@ class MainWindow(QMainWindow):
         return abs(self.current_cap_effective_hz - nominal) / nominal <= 0.20
 
     def start_full_workflow(self) -> None:
+        if not full_workflow_precomp_ready(self.mini45_precomp_enabled):
+            message = "请先完成 Mini45 预补偿 60s，再开始完整标定流程。"
+            QMessageBox.warning(self, "完整自动实验", message)
+            self._log(message)
+            return
         if self.workflow.active or self._calibration_active() or self.k_ident_active:
             QMessageBox.warning(self, "完整自动实验", "当前已有实验流程正在运行")
             return
@@ -2281,6 +2439,14 @@ class MainWindow(QMainWindow):
         self._drain_esp32()
         self._drain_mini45()
         self._drain_motion()
+        if self.mini45_precomp_active and self.mini45_precomp_start_monotonic_s is not None:
+            elapsed = max(0.0, time.monotonic() - self.mini45_precomp_start_monotonic_s)
+            self.mini45_precomp_status.setText(
+                f"预补偿：测量中 {min(elapsed, self.mini45_precomp_duration_s):.1f}/"
+                f"{self.mini45_precomp_duration_s:.0f} s，样本 {len(self.mini45_precomp_samples)}"
+            )
+            if elapsed >= self.mini45_precomp_duration_s:
+                self.finish_mini45_precomp()
         self._update_k_identification()
         if self.zero_drift_active and not self.calibration_paused and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
             self.finish_zero_drift("完成")
@@ -2377,15 +2543,21 @@ class MainWindow(QMainWindow):
                     self.force_frame_status.setText(f"坐标映射无效：{exc}")
                     self.force_frame_status.setStyleSheet("color: red")
                     continue
-                filtered_item = self.force_filter.update(mapped_item, self._force_filter_settings())
+                if self.mini45_precomp_active:
+                    # 预补偿统计固定使用坐标映射后的六轴未滤波数据。
+                    self.mini45_precomp_samples.append(mapped_item)
+                compensated_item = mapped_item
+                if self.mini45_precomp_enabled and not self.mini45_precomp_active:
+                    compensated_item = subtract_precomp_bias(mapped_item, self.mini45_precomp_bias)
+                filtered_item = self.force_filter.update(compensated_item, self._force_filter_settings())
                 self.last_force_time = filtered_item.monotonic_s
                 self.latest_force_sample = filtered_item
                 if first_sample:
                     self.mini_status.setText("Mini45 状态：数据正常")
                     self._log("Mini45 已收到第一帧可解析数据")
-                # 控制和稳定判定使用滤波后的传感器坐标力；CSV 原始时序仍写入未滤波数据。
+                # 控制和稳定判定使用补偿后再滤波的数据；CSV 的 mini45_raw_* 始终保留原始轴值。
                 control_snapshot = CombinedSnapshot.from_force(filtered_item, raw_sample=item)
-                raw_snapshot = CombinedSnapshot.from_force(mapped_item, raw_sample=item)
+                raw_snapshot = CombinedSnapshot.from_force(compensated_item, raw_sample=item)
                 self.buffer.append(control_snapshot)
                 if self.recorder:
                     if self.training_active and not self.calibration_paused:

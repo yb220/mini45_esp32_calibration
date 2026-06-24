@@ -48,11 +48,16 @@ def build_rdt_command(command: int, count: int = 0) -> bytes:
 def parse_rdt_packet(
     data: bytes,
     monotonic_s: float | None = None,
-    force_counts_per_unit: float = 1_000_000.0,
-    torque_counts_per_unit: float = 1_000_000.0,
+    force_counts_per_unit: float | None = None,
+    torque_counts_per_unit: float | None = None,
     force_signs: Iterable[float] = (1.0, 1.0, 1.0),
     torque_signs: Iterable[float] = (1.0, 1.0, 1.0),
 ) -> list[ForceSample]:
+    if force_counts_per_unit is None or torque_counts_per_unit is None:
+        raise ValueError(
+            "force_counts_per_unit 和 torque_counts_per_unit 必须提供，"
+            "请从 NETBA netftapi2.xml 的 cfgcpf/cfgcpt 字段获取"
+        )
     now = time.monotonic() if monotonic_s is None else monotonic_s
     fs = list(force_signs)
     ts = list(torque_signs)
@@ -97,11 +102,16 @@ class Mini45NetFTAdapter:
         self,
         ip: str,
         port: int = 49152,
-        force_counts_per_unit: float = 1_000_000.0,
-        torque_counts_per_unit: float = 1_000_000.0,
+        force_counts_per_unit: float | None = None,
+        torque_counts_per_unit: float | None = None,
         force_signs: Iterable[float] = (1.0, 1.0, 1.0),
         torque_signs: Iterable[float] = (1.0, 1.0, 1.0),
     ):
+        if force_counts_per_unit is None or torque_counts_per_unit is None:
+            raise ValueError(
+                "force_counts_per_unit 和 torque_counts_per_unit 必须提供，"
+                "请从 NETBA netftapi2.xml 的 cfgcpf/cfgcpt 字段获取"
+            )
         self.ip = ip
         self.port = port
         self.force_counts_per_unit = force_counts_per_unit

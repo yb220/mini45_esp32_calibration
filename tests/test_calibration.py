@@ -5,12 +5,20 @@ from app.calibration import (
     choose_control_axis,
     generate_fz_sequence,
     generate_shear_sequence,
+    generate_static_full_sequence,
     generate_three_axis_sequence,
     generate_training_trajectory,
+    is_static_collection_mode,
     advance_ramped_force_target,
+    filter_static_full_targets,
+    generate_missing_static_full_diagonal_targets,
+    parse_angles_deg,
     parse_force_levels,
+    static_full_target_angle_deg,
+    static_full_target_shear_n,
     training_target_reached,
     training_target_timed_out,
+    validate_force_targets,
 )
 from app.models import CombinedSnapshot, ExperimentMeta, ForceSample, SafetySettings, StabilitySettings
 from app.stability import evaluate_three_axis_stability
@@ -73,6 +81,179 @@ class CalibrationFlowTests(unittest.TestCase):
 
     def test_parse_force_levels(self):
         self.assertEqual(parse_force_levels("7,3，5 3"), [3.0, 5.0, 7.0])
+
+    def test_static_full_mode_uses_static_point_collector(self):
+        self.assertTrue(is_static_collection_mode("sequence"))
+        self.assertTrue(is_static_collection_mode("static_full"))
+        self.assertTrue(is_static_collection_mode("static_full_retest"))
+        self.assertFalse(is_static_collection_mode("combined"))
+
+    def test_static_full_sequence_contains_requested_diagonal_directions(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[0.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=parse_angles_deg("30,330"),
+            cycles=1,
+        )
+        directions = {target.direction for target in targets if target.axis == "combined"}
+        self.assertEqual(directions, {"diag_030", "diag_330"})
+
+    def test_static_full_default_matches_explicit_all_flows(self):
+        kwargs = dict(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[0.0, 1.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=[30.0],
+            cycles=2,
+        )
+        default = generate_static_full_sequence(**kwargs)
+        explicit = generate_static_full_sequence(
+            **kwargs,
+            enabled_flows={"fz", "fx", "fy", "diagonal"},
+            flow_cycles={"fz": 2, "fx": 2, "fy": 2, "diagonal": 2},
+        )
+        self.assertEqual(default, explicit)
+
+    def test_static_full_sequence_can_enable_only_fz(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=[],
+            cycles=3,
+            enabled_flows={"fz"},
+            flow_cycles={"fz": 2},
+        )
+        self.assertTrue(targets)
+        self.assertEqual({target.axis for target in targets}, {"Fz"})
+        self.assertEqual(max(target.cycle_index for target in targets), 2)
+
+    def test_static_full_sequence_can_disable_individual_shear_flows(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[0.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=[30.0],
+            cycles=1,
+            enabled_flows={"fx", "diagonal"},
+        )
+        self.assertEqual({target.axis for target in targets}, {"Fx", "combined"})
+        self.assertFalse(any(target.axis == "Fz" for target in targets))
+        self.assertFalse(any(target.axis == "Fy" for target in targets))
+
+    def test_static_full_flow_cycles_are_independent(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[0.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=[30.0],
+            cycles=1,
+            flow_cycles={"fz": 1, "fx": 2, "fy": 3, "diagonal": 4},
+        )
+        self.assertEqual(max(target.cycle_index for target in targets if target.axis == "Fz"), 1)
+        self.assertEqual(max(target.cycle_index for target in targets if target.axis == "Fx"), 2)
+        self.assertEqual(max(target.cycle_index for target in targets if target.axis == "Fy"), 3)
+        self.assertEqual(max(target.cycle_index for target in targets if target.axis == "combined"), 4)
+
+    def test_static_full_targets_reject_unsafe_preload(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[11.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=[30.0],
+            cycles=1,
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds safety limit"):
+            validate_force_targets(targets, (4.0, 4.0, 10.0))
+
+    def test_static_full_parsers_reject_non_finite_values(self):
+        with self.assertRaises(ValueError):
+            parse_force_levels("nan")
+        with self.assertRaises(ValueError):
+            parse_angles_deg("inf")
+
+    def test_filter_static_full_targets_selects_fy_slice(self):
+        targets = generate_static_full_sequence(
+            fz_max=1.0,
+            fz_step=1.0,
+            preload_levels=[0.0, 1.0],
+            shear_max=1.2,
+            shear_step=0.6,
+            diagonal_angles_deg=[30.0],
+            cycles=2,
+        )
+        selected = filter_static_full_targets(
+            targets,
+            axes={"Fy"},
+            branches={"loading"},
+            directions={"negative"},
+            cycles={2},
+            preload_levels={1.0},
+            shear_levels={0.6, 1.2},
+        )
+        self.assertTrue(selected)
+        self.assertEqual([target.point_index for target in selected], sorted(target.point_index for target in selected))
+        self.assertTrue(all(target.axis == "Fy" for target in selected))
+        self.assertTrue(all(target.branch == "loading" for target in selected))
+        self.assertTrue(all(target.direction == "negative" for target in selected))
+        self.assertTrue(all(target.cycle_index == 2 for target in selected))
+        self.assertTrue(all(target.target_fz == 1.0 for target in selected))
+        self.assertEqual([static_full_target_shear_n(target) for target in selected], [0.6, 1.2])
+
+    def test_filter_static_full_targets_selects_diagonal_angles(self):
+        targets = generate_static_full_sequence(
+            fz_max=0.0,
+            fz_step=1.0,
+            preload_levels=[0.0],
+            shear_max=0.6,
+            shear_step=0.6,
+            diagonal_angles_deg=parse_angles_deg("30,330"),
+            cycles=1,
+        )
+        selected = filter_static_full_targets(targets, axes={"combined"}, diagonal_angles_deg={330.0})
+        self.assertTrue(selected)
+        self.assertTrue(all(static_full_target_angle_deg(target) == 330.0 for target in selected))
+
+    def test_generate_missing_static_full_diagonal_targets_for_new_angles(self):
+        targets = generate_static_full_sequence(
+            fz_max=0.0,
+            fz_step=1.0,
+            preload_levels=[0.0, 1.0],
+            shear_max=1.2,
+            shear_step=0.6,
+            diagonal_angles_deg=parse_angles_deg("30,330"),
+            cycles=2,
+        )
+        generated = generate_missing_static_full_diagonal_targets(
+            targets,
+            axes={"combined"},
+            branches={"loading"},
+            cycles={2},
+            preload_levels={1.0},
+            shear_levels={0.6, 1.2},
+            diagonal_angles_deg={30.0, 45.0, 135.0},
+        )
+        self.assertTrue(generated)
+        self.assertEqual({static_full_target_angle_deg(target) for target in generated}, {45.0, 135.0})
+        self.assertTrue(all(target.axis == "combined" for target in generated))
+        self.assertTrue(all(target.branch == "loading" for target in generated))
+        self.assertTrue(all(target.cycle_index == 2 for target in generated))
+        self.assertTrue(all(target.target_fz == 1.0 for target in generated))
+        self.assertEqual([static_full_target_shear_n(target) for target in generated], [0.6, 1.2, 0.6, 1.2])
+        self.assertTrue(min(target.point_index for target in generated) > max(target.point_index for target in targets))
 
     def test_generate_training_fx_roundtrip(self):
         targets = generate_training_trajectory(

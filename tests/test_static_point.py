@@ -30,6 +30,19 @@ class StaticPointCollectorTests(unittest.TestCase):
         self.assertTrue(collector.complete)
         self.assertEqual(len(collector.selected_cap_samples()), 45)
 
+    def test_custom_required_cap_samples_controls_completion_and_selection(self):
+        collector = StaticPointCollector(required_cap_samples=10, stable_hold_s=0.0)
+        collector.begin(1.0)
+        collector.update_force_state(1.0, in_window=True, stable=True)
+        for sequence in range(9):
+            self.assertTrue(collector.add_cap_sample(cap(sequence)))
+        self.assertFalse(collector.complete)
+        self.assertEqual(collector.preserve_threshold, 8)
+        self.assertTrue(collector.add_cap_sample(cap(9)))
+        self.assertTrue(collector.complete)
+        self.assertFalse(collector.add_cap_sample(cap(10)))
+        self.assertEqual(len(collector.selected_cap_samples()), 10)
+
     def test_brief_excursion_pauses_and_retains_samples(self):
         collector = StaticPointCollector(stable_hold_s=0.0)
         collector.begin(1.0)

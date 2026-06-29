@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import queue
 import threading
 import time
@@ -125,6 +126,16 @@ CALIBRATION_FIELDS = [
     "note",
 ]
 
+RETEST_PREFIX_FIELDS = [
+    "retest_id",
+    "source_point_index",
+    "source_experiment_id",
+    "source_batch_dir",
+    "source_cycle_id",
+]
+RETEST_MARKER_FIELDS = RETEST_PREFIX_FIELDS + MARKER_FIELDS
+RETEST_CALIBRATION_FIELDS = RETEST_PREFIX_FIELDS + CALIBRATION_FIELDS
+
 FORCE_CONTROL_K_FIELDS = [
     "timestamp",
     "experiment_id",
@@ -197,6 +208,8 @@ FORCE_CONTROL_LOG_FIELDS = [
     "predicted_dFz",
     "note",
 ]
+RETEST_FORCE_CONTROL_K_FIELDS = ["retest_id"] + FORCE_CONTROL_K_FIELDS
+RETEST_FORCE_CONTROL_LOG_FIELDS = ["retest_id", "source_point_index"] + FORCE_CONTROL_LOG_FIELDS
 
 FORCE_FRAME_MAPPING_FIELDS = [
     "timestamp",
@@ -242,6 +255,11 @@ class CsvRecorder:
         self.force_control_log_file = None
         self.force_frame_mapping_file = None
         self.workflow_event_file = None
+        self.retest_raw_file = None
+        self.retest_marker_file = None
+        self.retest_cal_file = None
+        self.retest_force_control_k_file = None
+        self.retest_force_control_log_file = None
         self.raw_writer: Optional[csv.DictWriter] = None
         self.marker_writer: Optional[csv.DictWriter] = None
         self.cal_writer: Optional[csv.DictWriter] = None
@@ -254,57 +272,226 @@ class CsvRecorder:
         self.force_control_log_writer: Optional[csv.DictWriter] = None
         self.force_frame_mapping_writer: Optional[csv.DictWriter] = None
         self.workflow_event_writer: Optional[csv.DictWriter] = None
+        self.retest_raw_writer: Optional[csv.DictWriter] = None
+        self.retest_marker_writer: Optional[csv.DictWriter] = None
+        self.retest_cal_writer: Optional[csv.DictWriter] = None
+        self.retest_force_control_k_writer: Optional[csv.DictWriter] = None
+        self.retest_force_control_log_writer: Optional[csv.DictWriter] = None
         self.active_training_profile = "TRAINING_BALANCED"
         self.zero_drift_index = 0
         self.active_zero_path: Optional[Path] = None
+        self.static_full_retest_active = False
+        self.static_full_retest_id = ""
+        self.static_full_retest_manifest: dict[str, Any] = {}
+        self.static_full_retest_manifest_path: Optional[Path] = None
+        self.static_full_retest_source_point_index: int | str = ""
+        self.static_full_retest_source_cycle_id = ""
+        self._paths: dict[str, Path] = {}
+        self._retest_paths: dict[str, Path] = {}
+        self._resume = False
         self._pending_flush_rows = 0
         self._last_flush_s = time.monotonic()
         self._write_queue: queue.Queue[tuple[str, Any] | None] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._worker_error: Exception | None = None
 
-    def start(self) -> None:
+    def start(self, resume: bool = False) -> None:
         self._write_queue = queue.Queue()
         self._worker_error = None
+        self._resume = bool(resume)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_file = (self.output_dir / "raw_timeseries.csv").open("w", newline="", encoding="utf-8-sig")
-        self.marker_file = (self.output_dir / "markers.csv").open("w", newline="", encoding="utf-8-sig")
-        self.cal_file = (self.output_dir / "calibration_points.csv").open("w", newline="", encoding="utf-8-sig")
-        self.training_raw_file = (self.output_dir / "training_balanced_raw_timeseries.csv").open("w", newline="", encoding="utf-8-sig")
-        self.training_marker_file = (self.output_dir / "training_balanced_markers.csv").open("w", newline="", encoding="utf-8-sig")
-        self.training_fast_raw_file = (self.output_dir / "training_fast_raw_timeseries.csv").open("w", newline="", encoding="utf-8-sig")
-        self.training_fast_marker_file = (self.output_dir / "training_fast_markers.csv").open("w", newline="", encoding="utf-8-sig")
-        self.force_control_k_file = (self.output_dir / "force_control_k.csv").open("w", newline="", encoding="utf-8-sig")
-        self.force_control_log_file = (self.output_dir / "force_control_log.csv").open("w", newline="", encoding="utf-8-sig")
-        self.force_frame_mapping_file = (self.output_dir / "force_frame_mapping.csv").open("w", newline="", encoding="utf-8-sig")
-        self.workflow_event_file = (self.output_dir / "workflow_events.csv").open("w", newline="", encoding="utf-8-sig")
-        self.raw_writer = csv.DictWriter(self.raw_file, fieldnames=RAW_FIELDS)
-        self.marker_writer = csv.DictWriter(self.marker_file, fieldnames=MARKER_FIELDS)
-        self.cal_writer = csv.DictWriter(self.cal_file, fieldnames=CALIBRATION_FIELDS)
-        self.training_raw_writer = csv.DictWriter(self.training_raw_file, fieldnames=RAW_FIELDS)
-        self.training_marker_writer = csv.DictWriter(self.training_marker_file, fieldnames=TRAINING_MARKER_FIELDS)
-        self.training_fast_raw_writer = csv.DictWriter(self.training_fast_raw_file, fieldnames=RAW_FIELDS)
-        self.training_fast_marker_writer = csv.DictWriter(self.training_fast_marker_file, fieldnames=TRAINING_MARKER_FIELDS)
-        self.force_control_k_writer = csv.DictWriter(self.force_control_k_file, fieldnames=FORCE_CONTROL_K_FIELDS)
-        self.force_control_log_writer = csv.DictWriter(self.force_control_log_file, fieldnames=FORCE_CONTROL_LOG_FIELDS)
-        self.force_frame_mapping_writer = csv.DictWriter(self.force_frame_mapping_file, fieldnames=FORCE_FRAME_MAPPING_FIELDS)
-        self.workflow_event_writer = csv.DictWriter(self.workflow_event_file, fieldnames=WORKFLOW_EVENT_FIELDS)
-        self.raw_writer.writeheader()
-        self.marker_writer.writeheader()
-        self.cal_writer.writeheader()
-        self.training_raw_writer.writeheader()
-        self.training_marker_writer.writeheader()
-        self.training_fast_raw_writer.writeheader()
-        self.training_fast_marker_writer.writeheader()
-        self.force_control_k_writer.writeheader()
-        self.force_control_log_writer.writeheader()
-        self.force_frame_mapping_writer.writeheader()
-        self.workflow_event_writer.writeheader()
-        self.flush()
+        self._paths = {
+            "raw": self.output_dir / "raw_timeseries.csv",
+            "marker": self.output_dir / "markers.csv",
+            "cal": self.output_dir / "calibration_points.csv",
+            "training_raw": self.output_dir / "training_balanced_raw_timeseries.csv",
+            "training_marker": self.output_dir / "training_balanced_markers.csv",
+            "training_fast_raw": self.output_dir / "training_fast_raw_timeseries.csv",
+            "training_fast_marker": self.output_dir / "training_fast_markers.csv",
+            "force_control_k": self.output_dir / "force_control_k.csv",
+            "force_control_log": self.output_dir / "force_control_log.csv",
+            "force_frame_mapping": self.output_dir / "force_frame_mapping.csv",
+            "workflow_event": self.output_dir / "workflow_events.csv",
+        }
         self._worker = threading.Thread(target=self._writer_loop, name="csv-recorder-writer", daemon=True)
         self._worker.start()
 
+    def _ensure_writer(
+        self,
+        paths: dict[str, Path],
+        key: str,
+        file_attr: str,
+        writer_attr: str,
+        fieldnames: list[str],
+        *,
+        resume: bool,
+    ) -> Optional[csv.DictWriter]:
+        writer = getattr(self, writer_attr)
+        if writer:
+            return writer
+        path = paths.get(key)
+        if not path:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        has_content = bool(resume and path.exists() and path.stat().st_size > 0)
+        file_obj = path.open("a" if has_content else "w", newline="", encoding="utf-8-sig")
+        writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+        if not has_content:
+            writer.writeheader()
+        setattr(self, file_attr, file_obj)
+        setattr(self, writer_attr, writer)
+        return writer
+
+    def _ensure_main_writer(self, key: str) -> Optional[csv.DictWriter]:
+        specs = {
+            "raw": ("raw_file", "raw_writer", RAW_FIELDS),
+            "marker": ("marker_file", "marker_writer", MARKER_FIELDS),
+            "cal": ("cal_file", "cal_writer", CALIBRATION_FIELDS),
+            "training_raw": ("training_raw_file", "training_raw_writer", RAW_FIELDS),
+            "training_marker": ("training_marker_file", "training_marker_writer", TRAINING_MARKER_FIELDS),
+            "training_fast_raw": ("training_fast_raw_file", "training_fast_raw_writer", RAW_FIELDS),
+            "training_fast_marker": ("training_fast_marker_file", "training_fast_marker_writer", TRAINING_MARKER_FIELDS),
+            "force_control_k": ("force_control_k_file", "force_control_k_writer", FORCE_CONTROL_K_FIELDS),
+            "force_control_log": ("force_control_log_file", "force_control_log_writer", FORCE_CONTROL_LOG_FIELDS),
+            "force_frame_mapping": ("force_frame_mapping_file", "force_frame_mapping_writer", FORCE_FRAME_MAPPING_FIELDS),
+            "workflow_event": ("workflow_event_file", "workflow_event_writer", WORKFLOW_EVENT_FIELDS),
+        }
+        file_attr, writer_attr, fieldnames = specs[key]
+        return self._ensure_writer(
+            self._paths,
+            key,
+            file_attr,
+            writer_attr,
+            fieldnames,
+            resume=self._resume,
+        )
+
+    def _ensure_retest_writer(self, key: str) -> Optional[csv.DictWriter]:
+        specs = {
+            "raw_timeseries": ("retest_raw_file", "retest_raw_writer", RAW_FIELDS),
+            "markers": ("retest_marker_file", "retest_marker_writer", RETEST_MARKER_FIELDS),
+            "calibration_points": ("retest_cal_file", "retest_cal_writer", RETEST_CALIBRATION_FIELDS),
+            "force_control_k": ("retest_force_control_k_file", "retest_force_control_k_writer", RETEST_FORCE_CONTROL_K_FIELDS),
+            "force_control_log": ("retest_force_control_log_file", "retest_force_control_log_writer", RETEST_FORCE_CONTROL_LOG_FIELDS),
+        }
+        file_attr, writer_attr, fieldnames = specs[key]
+        return self._ensure_writer(
+            self._retest_paths,
+            key,
+            file_attr,
+            writer_attr,
+            fieldnames,
+            resume=False,
+        )
+
+    def start_static_full_retest(
+        self,
+        *,
+        retest_id: str | None = None,
+        manifest: dict[str, Any] | None = None,
+    ) -> dict[str, Path]:
+        if self.static_full_retest_active:
+            raise RuntimeError("static full retest is already active")
+        self._wait_for_writes()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        retest_id = retest_id or time.strftime("%Y%m%d_%H%M%S")
+        stem = f"static_full_retest_{retest_id}"
+        paths = {
+            "raw_timeseries": self.output_dir / f"{stem}_raw_timeseries.csv",
+            "markers": self.output_dir / f"{stem}_markers.csv",
+            "calibration_points": self.output_dir / f"{stem}_calibration_points.csv",
+            "force_control_k": self.output_dir / f"{stem}_force_control_k.csv",
+            "force_control_log": self.output_dir / f"{stem}_force_control_log.csv",
+            "manifest": self.output_dir / f"{stem}_manifest.json",
+        }
+        self._retest_paths = {key: value for key, value in paths.items() if key != "manifest"}
+        self.static_full_retest_active = True
+        self.static_full_retest_id = retest_id
+        self.static_full_retest_source_point_index = ""
+        self.static_full_retest_source_cycle_id = ""
+        self.static_full_retest_manifest_path = paths["manifest"]
+        self.static_full_retest_manifest = dict(manifest or {})
+        self.static_full_retest_manifest.update(
+            {
+                "retest_id": retest_id,
+                "status": "running",
+                "started_at": utc_timestamp(),
+                "output_files": {name: path.name for name, path in paths.items()},
+            }
+        )
+        self._write_static_full_retest_manifest()
+        self._flush_files()
+        return paths
+
+    def set_static_full_retest_source(
+        self,
+        *,
+        source_point_index: int | str = "",
+        source_cycle_id: str = "",
+    ) -> None:
+        self.static_full_retest_source_point_index = source_point_index
+        self.static_full_retest_source_cycle_id = source_cycle_id
+
+    def update_static_full_retest_manifest(self, **values: Any) -> None:
+        if not self.static_full_retest_manifest_path:
+            return
+        self.static_full_retest_manifest.update(values)
+        self._write_static_full_retest_manifest()
+
+    def finish_static_full_retest(
+        self,
+        *,
+        status: str,
+        reason: str = "",
+        completed_points: int | None = None,
+        invalid_points: int | None = None,
+    ) -> None:
+        if not self.static_full_retest_active:
+            return
+        self._wait_for_writes()
+        self.static_full_retest_manifest.update(
+            {
+                "status": status,
+                "finished_at": utc_timestamp(),
+                "reason": reason,
+            }
+        )
+        if completed_points is not None:
+            self.static_full_retest_manifest["completed_points"] = completed_points
+        if invalid_points is not None:
+            self.static_full_retest_manifest["invalid_points"] = invalid_points
+        self._write_static_full_retest_manifest()
+        for file_obj in (
+            self.retest_raw_file,
+            self.retest_marker_file,
+            self.retest_cal_file,
+            self.retest_force_control_k_file,
+            self.retest_force_control_log_file,
+        ):
+            if file_obj:
+                file_obj.flush()
+                file_obj.close()
+        self.retest_raw_file = self.retest_marker_file = self.retest_cal_file = None
+        self.retest_force_control_k_file = self.retest_force_control_log_file = None
+        self.retest_raw_writer = self.retest_marker_writer = self.retest_cal_writer = None
+        self.retest_force_control_k_writer = self.retest_force_control_log_writer = None
+        self.static_full_retest_active = False
+        self.static_full_retest_id = ""
+        self.static_full_retest_source_point_index = ""
+        self.static_full_retest_source_cycle_id = ""
+        self._retest_paths = {}
+
+    def _write_static_full_retest_manifest(self) -> None:
+        if not self.static_full_retest_manifest_path:
+            return
+        self.static_full_retest_manifest_path.write_text(
+            json.dumps(self.static_full_retest_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def stop(self) -> None:
+        if self.static_full_retest_active:
+            self.finish_static_full_retest(status="closed", reason="recorder stopped")
         self.stop_zero_drift_timeseries()
         self._wait_for_writes()
         if self._worker:
@@ -324,6 +511,11 @@ class CsvRecorder:
             self.force_control_log_file,
             self.force_frame_mapping_file,
             self.workflow_event_file,
+            self.retest_raw_file,
+            self.retest_marker_file,
+            self.retest_cal_file,
+            self.retest_force_control_k_file,
+            self.retest_force_control_log_file,
         ):
             if file_obj:
                 file_obj.flush()
@@ -337,6 +529,13 @@ class CsvRecorder:
         self.training_fast_raw_writer = self.training_fast_marker_writer = None
         self.force_control_k_writer = self.force_control_log_writer = self.force_frame_mapping_writer = None
         self.workflow_event_writer = None
+        self.retest_raw_file = self.retest_marker_file = self.retest_cal_file = None
+        self.retest_force_control_k_file = self.retest_force_control_log_file = None
+        self.retest_raw_writer = self.retest_marker_writer = self.retest_cal_writer = None
+        self.retest_force_control_k_writer = self.retest_force_control_log_writer = None
+        self._paths = {}
+        self._retest_paths = {}
+        self._resume = False
         self._pending_flush_rows = 0
 
     def _open_files(self):
@@ -353,6 +552,11 @@ class CsvRecorder:
             self.force_control_log_file,
             self.force_frame_mapping_file,
             self.workflow_event_file,
+            self.retest_raw_file,
+            self.retest_marker_file,
+            self.retest_cal_file,
+            self.retest_force_control_k_file,
+            self.retest_force_control_log_file,
         )
 
     def flush(self) -> None:
@@ -404,63 +608,159 @@ class CsvRecorder:
         source = snapshot.to_row()
         return {field: source.get(field, "") for field in RAW_FIELDS}
 
+    def _retest_prefix_row(self, source_cycle_id: str = "") -> dict:
+        manifest = self.static_full_retest_manifest
+        return {
+            "retest_id": self.static_full_retest_id,
+            "source_point_index": self.static_full_retest_source_point_index,
+            "source_experiment_id": manifest.get("source_experiment_id", ""),
+            "source_batch_dir": manifest.get("source_batch_dir", str(self.output_dir)),
+            "source_cycle_id": source_cycle_id or self.static_full_retest_source_cycle_id,
+        }
+
     def _write_task(self, kind: str, payload: Any) -> None:
-        if kind == "raw" and self.raw_writer:
-            self.raw_writer.writerow(self._snapshot_row(payload))
+        if kind == "raw":
+            writer = self._ensure_main_writer("raw")
+            if not writer:
+                return
+            writer.writerow(self._snapshot_row(payload))
+            self._mark_dirty()
+        elif kind == "retest_raw":
+            writer = self._ensure_retest_writer("raw_timeseries")
+            if not writer:
+                return
+            writer.writerow(self._snapshot_row(payload))
             self._mark_dirty()
         elif kind == "zero" and self.zero_writer:
             self.zero_writer.writerow(self._snapshot_row(payload))
             self._mark_dirty()
-        elif kind == "training_raw" and self.training_raw_writer:
-            self.training_raw_writer.writerow(self._snapshot_row(payload))
+        elif kind == "training_raw":
+            writer = self._ensure_main_writer("training_raw")
+            if not writer:
+                return
+            writer.writerow(self._snapshot_row(payload))
             self._mark_dirty()
-        elif kind == "marker" and self.marker_writer:
-            self.marker_writer.writerow(payload)
+        elif kind == "marker":
+            writer = self._ensure_main_writer("marker")
+            if not writer:
+                return
+            writer.writerow(payload)
             self._mark_dirty(force=True)
-        elif kind == "calibration" and self.cal_writer:
+        elif kind == "retest_marker":
+            writer = self._ensure_retest_writer("markers")
+            if not writer:
+                return
+            out = {field: payload.get(field, "") for field in MARKER_FIELDS}
+            row = self._retest_prefix_row(str(out.get("cycle_id") or ""))
+            row.update(out)
+            writer.writerow({field: row.get(field, "") for field in RETEST_MARKER_FIELDS})
+            self._mark_dirty(force=True)
+        elif kind == "calibration":
+            writer = self._ensure_main_writer("cal")
+            if not writer:
+                return
             row = {field: payload.to_row().get(field, "") for field in CALIBRATION_FIELDS}
-            self.cal_writer.writerow(row)
+            writer.writerow(row)
             self._mark_dirty(force=True)
-        elif kind == "training_marker" and self.training_marker_writer:
-            self.training_marker_writer.writerow(payload)
+        elif kind == "retest_calibration":
+            writer = self._ensure_retest_writer("calibration_points")
+            if not writer:
+                return
+            row = {field: payload.to_row().get(field, "") for field in CALIBRATION_FIELDS}
+            prefix = self._retest_prefix_row(str(row.get("cycle_id") or ""))
+            prefix.update(row)
+            writer.writerow({field: prefix.get(field, "") for field in RETEST_CALIBRATION_FIELDS})
             self._mark_dirty(force=True)
-        elif kind == "training_fast_raw" and self.training_fast_raw_writer:
-            self.training_fast_raw_writer.writerow(self._snapshot_row(payload))
+        elif kind == "training_marker":
+            writer = self._ensure_main_writer("training_marker")
+            if not writer:
+                return
+            writer.writerow(payload)
+            self._mark_dirty(force=True)
+        elif kind == "training_fast_raw":
+            writer = self._ensure_main_writer("training_fast_raw")
+            if not writer:
+                return
+            writer.writerow(self._snapshot_row(payload))
             self._mark_dirty()
-        elif kind == "training_fast_marker" and self.training_fast_marker_writer:
-            self.training_fast_marker_writer.writerow(payload)
+        elif kind == "training_fast_marker":
+            writer = self._ensure_main_writer("training_fast_marker")
+            if not writer:
+                return
+            writer.writerow(payload)
             self._mark_dirty(force=True)
-        elif kind == "force_control_k" and self.force_control_k_writer:
+        elif kind == "force_control_k":
+            writer = self._ensure_main_writer("force_control_k")
+            if not writer:
+                return
             out = {field: payload.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
             out["timestamp"] = out["timestamp"] or utc_timestamp()
-            self.force_control_k_writer.writerow(out)
+            writer.writerow(out)
             self._mark_dirty(force=True)
-        elif kind == "force_control_log" and self.force_control_log_writer:
+        elif kind == "retest_force_control_k":
+            writer = self._ensure_retest_writer("force_control_k")
+            if not writer:
+                return
+            out = {field: payload.get(field, "") for field in FORCE_CONTROL_K_FIELDS}
+            out["timestamp"] = out["timestamp"] or utc_timestamp()
+            row = {"retest_id": self.static_full_retest_id, **out}
+            writer.writerow({field: row.get(field, "") for field in RETEST_FORCE_CONTROL_K_FIELDS})
+            self._mark_dirty(force=True)
+        elif kind == "force_control_log":
+            writer = self._ensure_main_writer("force_control_log")
+            if not writer:
+                return
             out = {field: payload.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
             out["timestamp"] = out["timestamp"] or utc_timestamp()
-            self.force_control_log_writer.writerow(out)
+            writer.writerow(out)
             self._mark_dirty()
-        elif kind == "force_frame_mapping" and self.force_frame_mapping_writer:
+        elif kind == "retest_force_control_log":
+            writer = self._ensure_retest_writer("force_control_log")
+            if not writer:
+                return
+            out = {field: payload.get(field, "") for field in FORCE_CONTROL_LOG_FIELDS}
+            out["timestamp"] = out["timestamp"] or utc_timestamp()
+            row = {
+                "retest_id": self.static_full_retest_id,
+                "source_point_index": self.static_full_retest_source_point_index,
+                **out,
+            }
+            writer.writerow({field: row.get(field, "") for field in RETEST_FORCE_CONTROL_LOG_FIELDS})
+            self._mark_dirty()
+        elif kind == "force_frame_mapping":
+            writer = self._ensure_main_writer("force_frame_mapping")
+            if not writer:
+                return
             out = {field: payload.get(field, "") for field in FORCE_FRAME_MAPPING_FIELDS}
             out["timestamp"] = out["timestamp"] or utc_timestamp()
-            self.force_frame_mapping_writer.writerow(out)
+            writer.writerow(out)
             self._mark_dirty(force=True)
-        elif kind == "workflow_event" and self.workflow_event_writer:
+        elif kind == "workflow_event":
+            writer = self._ensure_main_writer("workflow_event")
+            if not writer:
+                return
             out = {field: payload.get(field, "") for field in WORKFLOW_EVENT_FIELDS}
             out["timestamp"] = out["timestamp"] or utc_timestamp()
-            self.workflow_event_writer.writerow(out)
+            writer.writerow(out)
             self._mark_dirty(force=True)
 
     def write_raw(self, snapshot: CombinedSnapshot) -> None:
-        if not self.raw_writer:
+        if self.static_full_retest_active:
+            self._enqueue("retest_raw", snapshot)
+            return
+        if not self._paths:
             return
         self._enqueue("raw", snapshot)
 
     def write_marker(self, marker_id: int, meta: ExperimentMeta) -> None:
-        if not self.marker_writer:
+        if self.static_full_retest_active:
+            kind = "retest_marker"
+        elif self._paths:
+            kind = "marker"
+        else:
             return
         self._enqueue(
-            "marker",
+            kind,
             {
                 "timestamp": utc_timestamp(),
                 "marker_id": marker_id,
@@ -478,7 +778,10 @@ class CsvRecorder:
         )
 
     def write_calibration_point(self, point: CalibrationPoint) -> None:
-        if not self.cal_writer:
+        if self.static_full_retest_active:
+            self._enqueue("retest_calibration", point)
+            return
+        if not self._paths:
             return
         self._enqueue("calibration", point)
 
@@ -518,6 +821,8 @@ class CsvRecorder:
         self._flush_files()
 
     def write_training_raw(self, snapshot: CombinedSnapshot, profile: str | None = None) -> None:
+        if not self._paths:
+            return
         normalized = str(profile or self.active_training_profile).strip().upper()
         kind = "training_fast_raw" if normalized == "TRAINING_FAST" else "training_raw"
         self._enqueue(kind, snapshot)
@@ -532,6 +837,8 @@ class CsvRecorder:
         target_angle_deg: float | str = "",
         profile: str | None = None,
     ) -> None:
+        if not self._paths:
+            return
         normalized = str(profile or self.active_training_profile).strip().upper()
         self._enqueue(
             "training_fast_marker" if normalized == "TRAINING_FAST" else "training_marker",
@@ -568,22 +875,28 @@ class CsvRecorder:
         self._last_flush_s = time.monotonic()
 
     def write_force_control_k(self, row: dict) -> None:
-        if not self.force_control_k_writer:
+        if self.static_full_retest_active:
+            self._enqueue("retest_force_control_k", dict(row))
+            return
+        if not self._paths:
             return
         self._enqueue("force_control_k", dict(row))
 
     def write_force_control_log(self, row: dict) -> None:
-        if not self.force_control_log_writer:
+        if self.static_full_retest_active:
+            self._enqueue("retest_force_control_log", dict(row))
+            return
+        if not self._paths:
             return
         self._enqueue("force_control_log", dict(row))
 
     def write_force_frame_mapping(self, row: dict) -> None:
-        if not self.force_frame_mapping_writer:
+        if not self._paths:
             return
         self._enqueue("force_frame_mapping", dict(row))
 
     def write_workflow_event(self, row: dict) -> None:
-        if not self.workflow_event_writer:
+        if not self._paths:
             return
         self._enqueue("workflow_event", dict(row))
 

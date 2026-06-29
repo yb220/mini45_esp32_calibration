@@ -10,6 +10,8 @@ from .models import ExperimentMeta, ForceSample, StabilitySettings
 
 FORCE_AXES = ("Fx", "Fy", "Fz")
 FORCE_FIELDS = {"Fx": "fx", "Fy": "fy", "Fz": "fz"}
+STATIC_COLLECTION_MODES = frozenset({"sequence", "static_full", "static_full_retest"})
+STATIC_FULL_FLOWS = ("fz", "fx", "fy", "diagonal")
 
 
 @dataclass
@@ -166,9 +168,319 @@ def parse_force_levels(text: str) -> list[float]:
     values = sorted({_round_force(float(token)) for token in tokens})
     if not values:
         raise ValueError("Fz levels must not be empty")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("Fz levels must be finite")
     if any(value < 0 for value in values):
         raise ValueError("Fz levels must be non-negative")
     return values
+
+
+def parse_angles_deg(text: str) -> list[float]:
+    """Parse comma/semicolon/space-separated angle values in degrees."""
+    tokens = [token for token in re.split(r"[,，;；\s]+", text.strip()) if token]
+    if not tokens:
+        raise ValueError("angles must not be empty")
+    parsed = [_round_force(float(token)) for token in tokens]
+    if any(not math.isfinite(value) for value in parsed):
+        raise ValueError("angles must be finite")
+    values = sorted({value % 360.0 for value in parsed})
+    if not values:
+        raise ValueError("no valid angles")
+    return values
+
+
+def is_static_collection_mode(mode: str) -> bool:
+    """Return whether *mode* advances through StaticPointCollector."""
+    return str(mode) in STATIC_COLLECTION_MODES
+
+
+def validate_force_targets(
+    targets: list[CalibrationTarget],
+    limits: tuple[float, float, float],
+) -> None:
+    """Reject non-finite targets and targets outside configured force limits."""
+    for target in targets:
+        values = (target.target_fx, target.target_fy, target.target_fz)
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError(f"point {target.point_index} contains a non-finite force target")
+        for axis, value, limit in zip(FORCE_AXES, values, limits):
+            if abs(float(value)) > float(limit):
+                raise ValueError(
+                    f"point {target.point_index} target {axis}={float(value):.3f} N "
+                    f"exceeds safety limit {float(limit):.3f} N"
+                )
+
+
+def static_full_target_shear_n(target: CalibrationTarget) -> float:
+    return _round_force(math.hypot(float(target.target_fx), float(target.target_fy)))
+
+
+def static_full_target_angle_deg(target: CalibrationTarget) -> float | None:
+    if target.axis != "combined":
+        return None
+    if str(target.direction).startswith("diag_"):
+        try:
+            return _round_force(float(str(target.direction).split("_", 1)[1]) % 360.0)
+        except (IndexError, ValueError):
+            pass
+    shear = static_full_target_shear_n(target)
+    if shear <= 1e-12:
+        return None
+    return _round_force((math.degrees(math.atan2(target.target_fy, target.target_fx)) + 360.0) % 360.0)
+
+
+def _matches_float_filter(value: float, allowed: set[float], tolerance: float) -> bool:
+    return any(abs(float(value) - candidate) <= tolerance for candidate in allowed)
+
+
+def filter_static_full_targets(
+    targets: list[CalibrationTarget],
+    *,
+    axes: set[str] | None = None,
+    branches: set[str] | None = None,
+    directions: set[str] | None = None,
+    cycles: set[int] | None = None,
+    preload_levels: set[float] | None = None,
+    shear_levels: set[float] | None = None,
+    diagonal_angles_deg: set[float] | None = None,
+    tolerance: float = 1e-6,
+) -> list[CalibrationTarget]:
+    """Return all-static targets matching retest filters, preserving source order."""
+    normalized_axes = {str(value) for value in axes} if axes else None
+    normalized_branches = {str(value) for value in branches} if branches else None
+    normalized_directions = {str(value) for value in directions} if directions else None
+    normalized_cycles = {int(value) for value in cycles} if cycles else None
+    normalized_preloads = {_round_force(value) for value in preload_levels} if preload_levels else None
+    normalized_shear = {_round_force(value) for value in shear_levels} if shear_levels else None
+    normalized_angles = {_round_force(value % 360.0) for value in diagonal_angles_deg} if diagonal_angles_deg else None
+
+    selected: list[CalibrationTarget] = []
+    for target in targets:
+        if normalized_axes is not None and target.axis not in normalized_axes:
+            continue
+        if normalized_branches is not None and target.branch not in normalized_branches:
+            continue
+        if normalized_directions is not None and target.direction not in normalized_directions:
+            continue
+        if normalized_cycles is not None and int(target.cycle_index) not in normalized_cycles:
+            continue
+        if normalized_preloads is not None and not _matches_float_filter(target.target_fz, normalized_preloads, tolerance):
+            continue
+        if normalized_shear is not None and not _matches_float_filter(static_full_target_shear_n(target), normalized_shear, tolerance):
+            continue
+        if normalized_angles is not None:
+            angle = static_full_target_angle_deg(target)
+            if angle is None or not _matches_float_filter(angle, normalized_angles, tolerance):
+                continue
+        selected.append(target)
+    return selected
+
+
+def _source_values(
+    targets: list[CalibrationTarget],
+    *,
+    axis: str | None,
+    attr: str,
+) -> set[float]:
+    values: set[float] = set()
+    for target in targets:
+        if axis is not None and target.axis != axis:
+            continue
+        values.add(_round_force(float(getattr(target, attr))))
+    return values
+
+
+def _source_shear_values(targets: list[CalibrationTarget]) -> set[float]:
+    values = {static_full_target_shear_n(target) for target in targets if target.axis == "combined"}
+    if values:
+        return values
+    return {static_full_target_shear_n(target) for target in targets if target.axis in {"Fx", "Fy"}}
+
+
+def generate_missing_static_full_diagonal_targets(
+    source_targets: list[CalibrationTarget],
+    *,
+    diagonal_angles_deg: set[float] | None,
+    axes: set[str] | None = None,
+    branches: set[str] | None = None,
+    directions: set[str] | None = None,
+    cycles: set[int] | None = None,
+    preload_levels: set[float] | None = None,
+    shear_levels: set[float] | None = None,
+    tolerance: float = 1e-6,
+) -> list[CalibrationTarget]:
+    """Generate retest-only diagonal targets for requested angles absent from source targets."""
+    if not source_targets or not diagonal_angles_deg:
+        return []
+    if axes is not None and "combined" not in {str(value) for value in axes}:
+        return []
+    # Direction checkboxes are only meaningful for Fz/Fx/Fy targets. If the user narrows
+    # them, do not synthesize diagonal targets with diag_XXX directions.
+    if directions is not None:
+        return []
+
+    requested_angles = sorted({_round_force(float(value) % 360.0) for value in diagonal_angles_deg})
+    existing_angles = {
+        angle
+        for angle in (static_full_target_angle_deg(target) for target in source_targets)
+        if angle is not None
+    }
+    missing_angles = [
+        angle
+        for angle in requested_angles
+        if not _matches_float_filter(angle, existing_angles, tolerance)
+    ]
+    if not missing_angles:
+        return []
+
+    selected_branches = sorted({str(value) for value in branches}) if branches else ["loading", "unloading"]
+    selected_cycles = sorted({int(value) for value in cycles}) if cycles else sorted(
+        {int(target.cycle_index) for target in source_targets}
+    )
+    selected_preloads = sorted({_round_force(value) for value in preload_levels}) if preload_levels else sorted(
+        _source_values(source_targets, axis="combined", attr="target_fz")
+        or _source_values(source_targets, axis=None, attr="target_fz")
+    )
+    selected_shear = sorted({_round_force(value) for value in shear_levels}) if shear_levels else sorted(
+        _source_shear_values(source_targets)
+    )
+    if not selected_branches or not selected_cycles or not selected_preloads or not selected_shear:
+        return []
+
+    next_index = max((int(target.point_index) for target in source_targets), default=0) + 1
+    generated: list[CalibrationTarget] = []
+    for fz in selected_preloads:
+        for cycle in selected_cycles:
+            for angle in missing_angles:
+                rad = math.radians(angle)
+                cos_a = _round_force(math.cos(rad))
+                sin_a = _round_force(math.sin(rad))
+                direction = f"diag_{int(round(angle)) % 360:03d}"
+                for branch in selected_branches:
+                    values = selected_shear if branch == "loading" else list(reversed(selected_shear[:-1]))
+                    for shear in values:
+                        generated.append(
+                            CalibrationTarget(
+                                "combined",
+                                direction,
+                                branch,
+                                _round_force(shear * cos_a),
+                                _round_force(shear * sin_a),
+                                fz,
+                                cycle,
+                                next_index,
+                            )
+                        )
+                        next_index += 1
+    return generated
+
+
+def generate_static_full_sequence(
+    fz_max: float,
+    fz_step: float,
+    preload_levels: list[float],
+    shear_max: float,
+    shear_step: float,
+    diagonal_angles_deg: list[float],
+    cycles: int = 3,
+    enabled_flows: set[str] | list[str] | tuple[str, ...] | None = None,
+    flow_cycles: dict[str, int] | None = None,
+) -> list[CalibrationTarget]:
+    """Generate the complete all-static calibration sequence.
+
+    Four phases, each repeated *cycles* times:
+
+    1. **Fz 单轴标定** — pure Fz loading 0→max→0, Fx=Fy=0 (no shear).
+       Uses :func:`generate_fz_sequence` directly.
+    2. **Fx 单轴加载** — at each preload level, sweep Fx ±shear_max,
+       Fy=0, Fz held constant.
+    3. **Fy 单轴加载** — same, sweep Fy with Fx=0, Fz held constant.
+    4. **斜向加载** — at each preload level, radial sweep along every
+       angle in *diagonal_angles_deg*, Fz held constant.
+
+    All targets share :class:`CalibrationTarget` format — plug straight
+    into the existing auto‑force / static‑point pipeline.
+    """
+    selected_flows = set(STATIC_FULL_FLOWS) if enabled_flows is None else {str(flow) for flow in enabled_flows}
+    unknown = selected_flows - set(STATIC_FULL_FLOWS)
+    if unknown:
+        raise ValueError(f"unknown static full flow: {', '.join(sorted(unknown))}")
+    if not preload_levels and selected_flows & {"fx", "fy", "diagonal"}:
+        raise ValueError("preload_levels must not be empty")
+    if shear_max < 0:
+        raise ValueError("shear_max must be non-negative")
+    if shear_step <= 0:
+        raise ValueError("shear_step must be positive")
+    if cycles < 1:
+        raise ValueError("cycles must be >= 1")
+    flow_cycle_counts = {flow: int(cycles) for flow in STATIC_FULL_FLOWS}
+    if flow_cycles:
+        for flow, count in flow_cycles.items():
+            key = str(flow)
+            if key not in STATIC_FULL_FLOWS:
+                raise ValueError(f"unknown static full flow: {key}")
+            if int(count) < 1:
+                raise ValueError("flow cycles must be >= 1")
+            flow_cycle_counts[key] = int(count)
+
+    shear_values = _force_values(shear_max, shear_step)
+    shear_down = list(reversed(shear_values[:-1]))
+    targets: list[CalibrationTarget] = []
+    index = 1
+
+    # ---- Phase 1: Fz 单轴标定（纯法向，Fx=Fy=0）----
+    if "fz" in selected_flows:
+        targets.extend(generate_fz_sequence(fz_max, fz_step, flow_cycle_counts["fz"]))
+        index = len(targets) + 1
+
+    # ---- Phases 2–4: 预载下剪切（Fz 保持恒定，扫 Fx / Fy / 斜向）----
+    for fz in sorted(preload_levels):
+
+        # Phase 2: Fx 单轴加载（Fz 预载不变，Fy=0）
+        if "fx" in selected_flows:
+            for cycle in range(1, flow_cycle_counts["fx"] + 1):
+                for sign, direction in ((1.0, "positive"), (-1.0, "negative")):
+                    for value in shear_values:
+                        targets.append(CalibrationTarget("Fx", direction, "loading", _round_force(sign * value), 0.0, fz, cycle, index))
+                        index += 1
+                    for value in shear_down:
+                        targets.append(CalibrationTarget("Fx", direction, "unloading", _round_force(sign * value), 0.0, fz, cycle, index))
+                        index += 1
+
+        # Phase 3: Fy 单轴加载（Fz 预载不变，Fx=0）
+        if "fy" in selected_flows:
+            for cycle in range(1, flow_cycle_counts["fy"] + 1):
+                for sign, direction in ((1.0, "positive"), (-1.0, "negative")):
+                    for value in shear_values:
+                        targets.append(CalibrationTarget("Fy", direction, "loading", 0.0, _round_force(sign * value), fz, cycle, index))
+                        index += 1
+                    for value in shear_down:
+                        targets.append(CalibrationTarget("Fy", direction, "unloading", 0.0, _round_force(sign * value), fz, cycle, index))
+                        index += 1
+
+        # Phase 4: 斜向加载（Fz 预载不变，径向扫）
+        if "diagonal" in selected_flows:
+            for cycle in range(1, flow_cycle_counts["diagonal"] + 1):
+                for angle in diagonal_angles_deg:
+                    rad = math.radians(angle)
+                    cos_a = _round_force(math.cos(rad))
+                    sin_a = _round_force(math.sin(rad))
+                    for value in shear_values:
+                        targets.append(CalibrationTarget(
+                            "combined", f"diag_{int(angle):03d}", "loading",
+                            _round_force(value * cos_a), _round_force(value * sin_a), fz,
+                            cycle, index,
+                        ))
+                        index += 1
+                    for value in shear_down:
+                        targets.append(CalibrationTarget(
+                            "combined", f"diag_{int(angle):03d}", "unloading",
+                            _round_force(value * cos_a), _round_force(value * sin_a), fz,
+                            cycle, index,
+                        ))
+                        index += 1
+
+    return targets
 
 
 def _append_training_target(

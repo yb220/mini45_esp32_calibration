@@ -277,8 +277,8 @@ class Mini45NetFTAdapter:
                         expected = (self._last_sequence + 1) & 0xFFFFFFFF
                         if sample.sequence != expected:
                             self._sequence_gap_count += 1
-                            if now - self._last_sequence_warning_s >= 1.0:
-                                self._last_sequence_warning_s = now
+                            if packet_t - self._last_sequence_warning_s >= 1.0:
+                                self._last_sequence_warning_s = packet_t
                                 self._put_output(
                                     Mini45Log(
                                         "warning",

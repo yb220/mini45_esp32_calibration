@@ -6,18 +6,41 @@ from pathlib import Path
 from app.models import CalibrationPoint, CombinedSnapshot, ExperimentMeta
 from app.recorder import (
     CALIBRATION_FIELDS,
-    FORCE_CONTROL_K_FIELDS,
-    FORCE_CONTROL_LOG_FIELDS,
-    FORCE_FRAME_MAPPING_FIELDS,
     MARKER_FIELDS,
     RAW_FIELDS,
+    RETEST_CALIBRATION_FIELDS,
     TRAINING_MARKER_FIELDS,
-    WORKFLOW_EVENT_FIELDS,
     CsvRecorder,
 )
 
 
 class RecorderTests(unittest.TestCase):
+    def test_start_stop_does_not_create_empty_measurement_csvs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            recorder = CsvRecorder(out)
+            recorder.start()
+            recorder.stop()
+
+            self.assertEqual(list(out.glob("*.csv")), [])
+
+    def test_resume_appends_without_rewriting_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            first = CsvRecorder(out)
+            first.start()
+            first.write_marker(1, ExperimentMeta(experiment_id="resume"))
+            first.stop()
+
+            resumed = CsvRecorder(out)
+            resumed.start(resume=True)
+            resumed.write_marker(2, ExperimentMeta(experiment_id="resume"))
+            resumed.stop()
+
+            with (out / "markers.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual([row["marker_id"] for row in rows], ["1", "2"])
+
     def test_recorder_writes_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -72,20 +95,14 @@ class RecorderTests(unittest.TestCase):
             with (out / "calibration_points.csv").open(encoding="utf-8-sig") as f:
                 self.assertEqual(next(csv.reader(f)), CALIBRATION_FIELDS)
             self.assertFalse((out / "zero_drift_summary.csv").exists())
-            with (out / "training_balanced_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), RAW_FIELDS)
-            with (out / "training_balanced_markers.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), TRAINING_MARKER_FIELDS)
-            with (out / "training_fast_raw_timeseries.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), RAW_FIELDS)
-            with (out / "force_control_k.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_K_FIELDS)
-            with (out / "force_control_log.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), FORCE_CONTROL_LOG_FIELDS)
-            with (out / "force_frame_mapping.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), FORCE_FRAME_MAPPING_FIELDS)
-            with (out / "workflow_events.csv").open(encoding="utf-8-sig") as f:
-                self.assertEqual(next(csv.reader(f)), WORKFLOW_EVENT_FIELDS)
+            self.assertFalse((out / "training_balanced_raw_timeseries.csv").exists())
+            self.assertFalse((out / "training_balanced_markers.csv").exists())
+            self.assertFalse((out / "training_fast_raw_timeseries.csv").exists())
+            self.assertFalse((out / "training_fast_markers.csv").exists())
+            self.assertFalse((out / "force_control_k.csv").exists())
+            self.assertFalse((out / "force_control_log.csv").exists())
+            self.assertFalse((out / "force_frame_mapping.csv").exists())
+            self.assertFalse((out / "workflow_events.csv").exists())
 
     def test_zero_drift_timeseries_uses_raw_schema_and_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +182,119 @@ class RecorderTests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows[0]["sensor_Fx_from"], "Fz")
             self.assertEqual(rows[0]["sensor_Fx_sign"], "-1")
+
+    def test_static_full_retest_writes_separate_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            recorder = CsvRecorder(out)
+            recorder.start()
+            recorder.write_calibration_point(
+                CalibrationPoint(
+                    timestamp_start="a",
+                    timestamp_end="b",
+                    experiment_id="base",
+                    cycle_id="cycle_001",
+                    branch="loading",
+                    axis="Fy",
+                    direction="positive",
+                    preload_N=1.0,
+                    target_Fx=0.0,
+                    target_Fy=0.6,
+                    target_Fz=1.0,
+                    Fx_mean=0.0,
+                    Fy_mean=0.6,
+                    Fz_mean=1.0,
+                    Mx_mean=0.0,
+                    My_mean=0.0,
+                    Mz_mean=0.0,
+                    Fx_std=0.0,
+                    Fy_std=0.0,
+                    Fz_std=0.0,
+                    C0_mean=1.0,
+                    C1_mean=2.0,
+                    C2_mean=3.0,
+                    C3_mean=4.0,
+                    C4_mean=5.0,
+                    C0_std=0.0,
+                    C1_std=0.0,
+                    C2_std=0.0,
+                    C3_std=0.0,
+                    C4_std=0.0,
+                    marker_id=1,
+                    valid=True,
+                    reject_reason="",
+                    note="",
+                )
+            )
+            recorder.flush()
+            recorder.start_static_full_retest(
+                retest_id="20260101_010203",
+                manifest={"source_experiment_id": "base", "source_batch_dir": str(out)},
+            )
+            recorder.set_static_full_retest_source(source_point_index=42, source_cycle_id="cycle_002")
+            recorder.write_raw(CombinedSnapshot(timestamp="t", monotonic_s=1.0, source="mini45", fx=0.1))
+            recorder.write_marker(2, ExperimentMeta(experiment_id="base", cycle_id="cycle_002", axis="Fy"))
+            recorder.write_calibration_point(
+                CalibrationPoint(
+                    timestamp_start="c",
+                    timestamp_end="d",
+                    experiment_id="base",
+                    cycle_id="cycle_002",
+                    branch="loading",
+                    axis="Fy",
+                    direction="positive",
+                    preload_N=1.0,
+                    target_Fx=0.0,
+                    target_Fy=0.6,
+                    target_Fz=1.0,
+                    Fx_mean=0.0,
+                    Fy_mean=0.6,
+                    Fz_mean=1.0,
+                    Mx_mean=0.0,
+                    My_mean=0.0,
+                    Mz_mean=0.0,
+                    Fx_std=0.0,
+                    Fy_std=0.0,
+                    Fz_std=0.0,
+                    C0_mean=1.0,
+                    C1_mean=2.0,
+                    C2_mean=3.0,
+                    C3_mean=4.0,
+                    C4_mean=5.0,
+                    C0_std=0.0,
+                    C1_std=0.0,
+                    C2_std=0.0,
+                    C3_std=0.0,
+                    C4_std=0.0,
+                    marker_id=2,
+                    valid=True,
+                    reject_reason="",
+                    note="retest",
+                )
+            )
+            recorder.write_force_control_log({"experiment_id": "base", "cycle_id": "cycle_002", "delta_X_mm": 0.01})
+            recorder.finish_static_full_retest(status="completed", completed_points=1, invalid_points=0)
+            recorder.stop()
+
+            with (out / "calibration_points.csv").open(encoding="utf-8-sig") as f:
+                main_rows = list(csv.DictReader(f))
+            self.assertEqual(len(main_rows), 1)
+
+            retest_cal = out / "static_full_retest_20260101_010203_calibration_points.csv"
+            with retest_cal.open(encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                self.assertEqual(next(reader), RETEST_CALIBRATION_FIELDS)
+            with retest_cal.open(encoding="utf-8-sig") as f:
+                retest_rows = list(csv.DictReader(f))
+            self.assertEqual(len(retest_rows), 1)
+            self.assertEqual(retest_rows[0]["retest_id"], "20260101_010203")
+            self.assertEqual(retest_rows[0]["source_point_index"], "42")
+
+            self.assertFalse((out / "force_control_log.csv").exists())
+            self.assertTrue((out / "static_full_retest_20260101_010203_raw_timeseries.csv").exists())
+            self.assertTrue((out / "static_full_retest_20260101_010203_force_control_log.csv").exists())
+            self.assertFalse((out / "static_full_retest_20260101_010203_force_control_k.csv").exists())
+            self.assertTrue((out / "static_full_retest_20260101_010203_manifest.json").exists())
 
 
 if __name__ == "__main__":

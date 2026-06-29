@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import random
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 try:
@@ -10,7 +11,7 @@ try:
 except ImportError:  # pragma: no cover
     serial = None
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QComboBox,
     QCheckBox,
@@ -37,15 +38,24 @@ import pyqtgraph as pg
 from .buffers import SampleBuffer
 from .calibration import (
     CalibrationTarget,
+    STATIC_FULL_FLOWS,
     TrainingTarget,
+    filter_static_full_targets,
+    generate_missing_static_full_diagonal_targets,
     generate_training_trajectory,
     generate_fz_sequence,
     generate_shear_sequence,
     generate_three_axis_sequence,
+    generate_static_full_sequence,
+    is_static_collection_mode,
     advance_ramped_force_target,
     parse_force_levels,
+    parse_angles_deg,
+    static_full_target_angle_deg,
+    static_full_target_shear_n,
     training_target_reached,
     training_target_timed_out,
+    validate_force_targets,
 )
 from .arduino_motion import (
     ArduinoMotionAdapter,
@@ -73,6 +83,7 @@ from .force_control import (
     MOTOR_AXES,
     DecoupledControlSettings,
     DecoupledControlState,
+    KIdentificationResult,
     compute_decoupled_command,
     force_stats,
     force_vector_from_sample,
@@ -97,7 +108,25 @@ from .models import (
 from .recorder import CsvRecorder
 from .stability import build_calibration_point, evaluate_three_axis_stability
 from .static_point import StaticPointCollector, collection_tolerances
+from .static_full_checkpoint import (
+    checkpoint_path,
+    legacy_completed_point_count,
+    legacy_last_marker_id,
+    load_checkpoint,
+    load_last_force_mapping,
+    load_last_valid_k_result,
+    load_latest_precomp,
+    save_checkpoint,
+)
 from .workflow import WorkflowState
+
+
+STATIC_FULL_FLOW_UI = (
+    ("fz", "Fz 单轴", "纯法向 Fz 0→最大→0"),
+    ("fx", "Fx 预载剪切", "在每个 Fz 预载层级下扫 Fx 正负方向"),
+    ("fy", "Fy 预载剪切", "在每个 Fz 预载层级下扫 Fy 正负方向"),
+    ("diagonal", "斜向预载剪切", "在每个 Fz 预载层级下按斜向角度径向扫剪切"),
+)
 
 
 class MainWindow(QMainWindow):
@@ -132,6 +161,7 @@ class MainWindow(QMainWindow):
         self.auto_force_in_window_since = 0.0
         self.auto_force_last_move = 0.0
         self.auto_force_next_move_time = 0.0
+        self.force_zero_active = False
         self.motion_last_query = 0.0
         self.calibration_mode = ""
         self.calibration_paused = False
@@ -179,10 +209,53 @@ class MainWindow(QMainWindow):
         self.training_ramp_target = (0.0, 0.0, 0.0)
         self.training_last_ramp_update_s = 0.0
 
+        # ---- 全静态标定 ----
+        self.static_full_active: bool = False
+        self.static_full_paused: bool = False
+        self.static_full_points_completed: int = 0
+        self.static_full_points_invalid: int = 0
+        self.static_full_returning_zero: bool = False
+        self._static_full_profile_wait: bool = False
+        self._static_full_profile_start_s: float = 0.0
+        self._static_full_pending_targets: list[CalibrationTarget] = []
+        self._static_full_pending_resume: dict | None = None
+        self.static_full_setup_stage: str = ""
+        self.static_full_auto_recording: bool = False
+        self.static_full_recovering_mini45: bool = False
+        self.static_full_recovering_esp32: bool = False
+        self.static_full_retest_active: bool = False
+        self.static_full_retest_folder: Path | None = None
+        self.static_full_retest_source_targets: list[CalibrationTarget] = []
+        self.static_full_retest_targets: list[CalibrationTarget] = []
+        self.static_full_retest_document: dict = {}
+        self.static_full_retest_filter_spec: dict = {}
+        self.static_full_retest_id: str = ""
+        self.static_full_retest_source_experiment_id: str = ""
+        self.static_full_retest_k_source: str = ""
+        self.static_full_retest_precomp_source: str = ""
+        self.static_full_retest_remeasure_precomp: bool = False
+        self.static_full_retest_remeasure_k: bool = False
+        self._mini45_reconnect_attempts: int = 0
+        self._mini45_reconnect_next_s: float = 0.0
+        self._mini45_reconnect_started_s: float = 0.0
+        self._mini45_reconnect_adapter_started_s: float = 0.0
+        self._esp32_reconnect_attempts: int = 0
+        self._esp32_reconnect_next_s: float = 0.0
+        self._esp32_reconnect_started_s: float = 0.0
+        self._esp32_reconnect_adapter_started_s: float = 0.0
+        self._esp32_reconnect_profile_next_s: float = 0.0
+
         self.force_x: list[float] = []
         self.force_y = {key: [] for key in ("fx", "fy", "fz")}
         self.cap_x: list[float] = []
         self.cap_y = {key: [] for key in ("c0", "c1", "c2", "c3", "c4")}
+        self.force_plot_dirty = False
+        self.cap_plot_dirty = False
+        self.pending_force_plot_sample: ForceSample | None = None
+        self.pending_cap_plot_sample: CapSample | None = None
+        self.last_plot_flush_wall_s = 0.0
+        self.plot_flush_interval_s = 0.10
+        self.plot_tick_budget_s = 0.030
         self.last_force_plot_update_s = 0.0
         self.last_cap_plot_update_s = 0.0
         self.last_cal_progress_update_s = 0.0
@@ -225,6 +298,11 @@ class MainWindow(QMainWindow):
         workflow_layout.addWidget(self._build_workflow_group())
         workflow_layout.addStretch(1)
         tabs.addTab(workflow_page, "完整流程")
+
+        static_full_page, static_full_layout = self._tab_page()
+        static_full_layout.addWidget(self._build_static_full_group())
+        static_full_layout.addStretch(1)
+        tabs.addTab(static_full_page, "全静态标定")
 
         calibration_page, calibration_layout = self._tab_page()
         calibration_layout.addWidget(self._build_calibration_group())
@@ -545,13 +623,254 @@ class MainWindow(QMainWindow):
         self._update_workflow_ui()
         return box
 
+    def _build_static_full_group(self) -> QGroupBox:
+        box = QGroupBox("全静态标定流程")
+        form = QFormLayout(box)
+
+        # ── Fz 单轴标定（纯法向，Fx=Fy=0）──
+        self.static_full_fz_label = QLabel("Fz 单轴标定")
+        self.static_full_fz_label.setStyleSheet("font-weight: bold;")
+        fz_row = QHBoxLayout()
+        self.static_full_fz_max = self._spin(0.0, 10.0, 9.0)
+        self.static_full_fz_max.setToolTip("Fz 单轴最大力 (N)")
+        self.static_full_fz_max.valueChanged.connect(self._update_static_full_estimate)
+        self.static_full_fz_step = self._spin(0.1, 10.0, 1.0)
+        self.static_full_fz_step.setToolTip("Fz 单轴步长 (N)")
+        self.static_full_fz_step.valueChanged.connect(self._update_static_full_estimate)
+        fz_row.addWidget(QLabel("最大"))
+        fz_row.addWidget(self.static_full_fz_max)
+        fz_row.addWidget(QLabel("步长"))
+        fz_row.addWidget(self.static_full_fz_step)
+        form.addRow(self.static_full_fz_label, fz_row)
+
+        # ── Fz 预载层级（保持 Fz 不变，扫剪切）──
+        self.static_full_preload_levels = QLineEdit("0,1,3,5")
+        self.static_full_preload_levels.setToolTip("逗号分隔：保持法向力不变时扫剪切的层级 (N)。含 0 做纯剪切基线")
+        self.static_full_preload_levels.textChanged.connect(self._update_static_full_estimate)
+        form.addRow("Fz 预载层级 N", self.static_full_preload_levels)
+
+        # ── 剪切力（Fx / Fy / 斜向共用）──
+        self.static_full_shear_label = QLabel("剪切力（Fx / Fy / 斜向）")
+        self.static_full_shear_label.setStyleSheet("font-weight: bold;")
+        shear_row = QHBoxLayout()
+        self.static_full_shear_max = self._spin(0.0, 4.0, 3.6)
+        self.static_full_shear_max.setToolTip("剪切最大力 (N)")
+        self.static_full_shear_max.valueChanged.connect(self._update_static_full_estimate)
+        self.static_full_shear_step = self._spin(0.1, 4.0, 0.6)
+        self.static_full_shear_step.setToolTip("剪切力步长 (N)")
+        self.static_full_shear_step.valueChanged.connect(self._update_static_full_estimate)
+        shear_row.addWidget(QLabel("最大"))
+        shear_row.addWidget(self.static_full_shear_max)
+        shear_row.addWidget(QLabel("步长"))
+        shear_row.addWidget(self.static_full_shear_step)
+        form.addRow(self.static_full_shear_label, shear_row)
+
+        # ── 斜向角度 ──
+        self.static_full_angles = QLineEdit("30,60,120,150,210,240,300,330")
+        self.static_full_angles.setToolTip("斜向加载角度（度），逗号分隔。0/90/180/270 已由 Fx/Fy 覆盖")
+        self.static_full_angles.textChanged.connect(self._update_static_full_estimate)
+        form.addRow("斜向角度 °", self.static_full_angles)
+
+        self.static_full_cap_samples = QSpinBox()
+        self.static_full_cap_samples.setRange(1, 1000)
+        self.static_full_cap_samples.setValue(45)
+        self.static_full_cap_samples.setToolTip("每个稳定点采集的唯一电容样本数量")
+        self.static_full_cap_samples.valueChanged.connect(self._update_static_full_estimate)
+        form.addRow("稳定点电容样本数", self.static_full_cap_samples)
+
+        # ── 测量流程 ──
+        flow_box = QGroupBox("测量流程")
+        flow_grid = QGridLayout(flow_box)
+        self.static_full_flow_checks: dict[str, QCheckBox] = {}
+        self.static_full_flow_cycles: dict[str, QSpinBox] = {}
+        flow_grid.addWidget(QLabel("启用"), 0, 0)
+        flow_grid.addWidget(QLabel("流程"), 0, 1)
+        flow_grid.addWidget(QLabel("重复组数"), 0, 2)
+        for row, (flow, label, tooltip) in enumerate(STATIC_FULL_FLOW_UI, start=1):
+            check = QCheckBox()
+            check.setChecked(True)
+            check.setToolTip(tooltip)
+            check.stateChanged.connect(self._update_static_full_flow_controls)
+            cycles = QSpinBox()
+            cycles.setRange(1, 20)
+            cycles.setValue(3)
+            cycles.setToolTip(f"{label}重复组数")
+            cycles.valueChanged.connect(self._update_static_full_estimate)
+            self.static_full_flow_checks[flow] = check
+            self.static_full_flow_cycles[flow] = cycles
+            flow_grid.addWidget(check, row, 0)
+            flow_grid.addWidget(QLabel(label), row, 1)
+            flow_grid.addWidget(cycles, row, 2)
+        form.addRow(flow_box)
+
+        # ── 预估时间 ──
+        self.static_full_estimate = QLabel("—")
+        self.static_full_estimate.setStyleSheet("font-weight: bold; color: #1565C0;")
+        form.addRow("预估时间", self.static_full_estimate)
+
+        # ── 按钮 ──
+        btns = QHBoxLayout()
+        self.static_full_start_btn = QPushButton("开始全静态标定")
+        self.static_full_start_btn.clicked.connect(self.start_static_full)
+        self.static_full_resume_file_btn = QPushButton("从已有实验继续")
+        self.static_full_resume_file_btn.clicked.connect(self.resume_static_full_from_folder)
+        self.static_full_pause_btn = QPushButton("暂停")
+        self.static_full_pause_btn.clicked.connect(self.pause_static_full)
+        self.static_full_resume_btn = QPushButton("继续")
+        self.static_full_resume_btn.clicked.connect(self.resume_static_full)
+        self.static_full_stop_btn = QPushButton("停止/急停")
+        self.static_full_stop_btn.clicked.connect(lambda: self.stop_static_full("人工停止"))
+        for b in (self.static_full_start_btn, self.static_full_resume_file_btn, self.static_full_pause_btn,
+                  self.static_full_resume_btn, self.static_full_stop_btn):
+            btns.addWidget(b)
+        form.addRow(btns)
+
+        # ── 状态 ──
+        self.static_full_status = QLabel("空闲")
+        self.static_full_status.setWordWrap(True)
+        self.static_full_status.setMinimumHeight(100)
+        self.static_full_status.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        form.addRow(self.static_full_status)
+
+        form.addRow(self._build_static_full_retest_group())
+
+        self._update_static_full_buttons()
+        self._update_static_full_estimate()
+        return box
+
+    def _update_static_full_flow_controls(self, *args: object) -> None:
+        if not hasattr(self, "static_full_flow_checks"):
+            return
+        active = self._static_full_busy() if hasattr(self, "static_full_active") else False
+        for flow, cycles in self.static_full_flow_cycles.items():
+            check = self.static_full_flow_checks[flow]
+            cycles.setEnabled(check.isChecked() and not active)
+        self._update_static_full_estimate()
+
+    def _static_full_enabled_flows(self) -> list[str]:
+        if not hasattr(self, "static_full_flow_checks"):
+            return list(STATIC_FULL_FLOWS)
+        return [flow for flow in STATIC_FULL_FLOWS if self.static_full_flow_checks[flow].isChecked()]
+
+    def _static_full_flow_cycle_values(self) -> dict[str, int]:
+        if not hasattr(self, "static_full_flow_cycles"):
+            return {flow: 3 for flow in STATIC_FULL_FLOWS}
+        return {flow: int(self.static_full_flow_cycles[flow].value()) for flow in STATIC_FULL_FLOWS}
+
+    def _static_full_required_cap_samples(self) -> int:
+        if not hasattr(self, "static_full_cap_samples"):
+            return 45
+        return int(self.static_full_cap_samples.value())
+
+    def _build_static_full_retest_group(self) -> QGroupBox:
+        box = QGroupBox("补测")
+        layout = QVBoxLayout(box)
+
+        folder_row = QHBoxLayout()
+        self.static_full_retest_folder_text = QLineEdit()
+        self.static_full_retest_folder_text.setReadOnly(True)
+        self.static_full_retest_folder_text.setPlaceholderText("选择已有全静态批次目录")
+        self.static_full_retest_load_btn = QPushButton("选择已有批次")
+        self.static_full_retest_load_btn.clicked.connect(self.load_static_full_retest_folder)
+        folder_row.addWidget(self.static_full_retest_folder_text, stretch=1)
+        folder_row.addWidget(self.static_full_retest_load_btn)
+        layout.addLayout(folder_row)
+
+        grid = QGridLayout()
+        self.static_full_retest_axis_checks: dict[str, QCheckBox] = {}
+        axis_row = QHBoxLayout()
+        for label, value in (("Fz", "Fz"), ("Fx", "Fx"), ("Fy", "Fy"), ("斜向", "combined")):
+            check = QCheckBox(label)
+            check.setChecked(True)
+            check.stateChanged.connect(self._update_static_full_retest_preview)
+            self.static_full_retest_axis_checks[value] = check
+            axis_row.addWidget(check)
+        grid.addWidget(QLabel("轴/阶段"), 0, 0)
+        grid.addLayout(axis_row, 0, 1)
+
+        self.static_full_retest_branch_checks: dict[str, QCheckBox] = {}
+        branch_row = QHBoxLayout()
+        for label, value in (("加载", "loading"), ("卸载", "unloading")):
+            check = QCheckBox(label)
+            check.setChecked(True)
+            check.stateChanged.connect(self._update_static_full_retest_preview)
+            self.static_full_retest_branch_checks[value] = check
+            branch_row.addWidget(check)
+        grid.addWidget(QLabel("分支"), 1, 0)
+        grid.addLayout(branch_row, 1, 1)
+
+        self.static_full_retest_direction_checks: dict[str, QCheckBox] = {}
+        direction_row = QHBoxLayout()
+        for label, value in (("正向", "positive"), ("负向", "negative"), ("无", "none")):
+            check = QCheckBox(label)
+            check.setChecked(True)
+            check.stateChanged.connect(self._update_static_full_retest_preview)
+            self.static_full_retest_direction_checks[value] = check
+            direction_row.addWidget(check)
+        grid.addWidget(QLabel("方向"), 2, 0)
+        grid.addLayout(direction_row, 2, 1)
+
+        self.static_full_retest_cycles = QLineEdit()
+        self.static_full_retest_cycles.setPlaceholderText("空=全部，例如 1,2")
+        self.static_full_retest_cycles.textChanged.connect(self._update_static_full_retest_preview)
+        grid.addWidget(QLabel("循环号"), 3, 0)
+        grid.addWidget(self.static_full_retest_cycles, 3, 1)
+
+        self.static_full_retest_preloads = QLineEdit()
+        self.static_full_retest_preloads.setPlaceholderText("空=全部，例如 0,1,3")
+        self.static_full_retest_preloads.textChanged.connect(self._update_static_full_retest_preview)
+        grid.addWidget(QLabel("Fz 预载 N"), 4, 0)
+        grid.addWidget(self.static_full_retest_preloads, 4, 1)
+
+        self.static_full_retest_shear_levels = QLineEdit()
+        self.static_full_retest_shear_levels.setPlaceholderText("空=全部，例如 0.6,1.2")
+        self.static_full_retest_shear_levels.textChanged.connect(self._update_static_full_retest_preview)
+        grid.addWidget(QLabel("剪切幅值 N"), 5, 0)
+        grid.addWidget(self.static_full_retest_shear_levels, 5, 1)
+
+        self.static_full_retest_angles = QLineEdit()
+        self.static_full_retest_angles.setPlaceholderText("空=全部，例如 30,330")
+        self.static_full_retest_angles.textChanged.connect(self._update_static_full_retest_preview)
+        grid.addWidget(QLabel("斜向角度 °"), 6, 0)
+        grid.addWidget(self.static_full_retest_angles, 6, 1)
+        layout.addLayout(grid)
+
+        reuse_row = QHBoxLayout()
+        self.static_full_retest_reprecomp = QCheckBox("重新做 Mini45 预补偿")
+        self.static_full_retest_rek = QCheckBox("重新辨识 K")
+        reuse_row.addWidget(self.static_full_retest_reprecomp)
+        reuse_row.addWidget(self.static_full_retest_rek)
+        layout.addLayout(reuse_row)
+
+        btns = QHBoxLayout()
+        self.static_full_retest_start_btn = QPushButton("开始补测")
+        self.static_full_retest_start_btn.clicked.connect(self.start_static_full_retest)
+        self.static_full_retest_pause_btn = QPushButton("暂停补测")
+        self.static_full_retest_pause_btn.clicked.connect(self.pause_static_full)
+        self.static_full_retest_resume_btn = QPushButton("继续补测")
+        self.static_full_retest_resume_btn.clicked.connect(self.resume_static_full)
+        self.static_full_retest_stop_btn = QPushButton("停止补测")
+        self.static_full_retest_stop_btn.clicked.connect(lambda: self.stop_static_full("补测停止"))
+        for button in (
+            self.static_full_retest_start_btn,
+            self.static_full_retest_pause_btn,
+            self.static_full_retest_resume_btn,
+            self.static_full_retest_stop_btn,
+        ):
+            btns.addWidget(button)
+        layout.addLayout(btns)
+
+        self.static_full_retest_status = QLabel("未加载补测批次")
+        self.static_full_retest_status.setWordWrap(True)
+        layout.addWidget(self.static_full_retest_status)
+        return box
+
     def _build_calibration_group(self) -> QGroupBox:
         box = QGroupBox("标定控制")
         layout = QVBoxLayout(box)
 
         self.basic_group = QGroupBox("基础信息")
         grid = QGridLayout(self.basic_group)
-        self.experiment_id = QLineEdit("sensor01_mount01")
         self.note = QLineEdit()
         self.experiment_mode = QComboBox()
         self.experiment_mode.addItem("空载零点漂移", "zero")
@@ -569,10 +888,8 @@ class MainWindow(QMainWindow):
         self.direction.addItem("无", "none")
         self.direction.addItem("正向", "positive")
         self.direction.addItem("负向", "negative")
-        grid.addWidget(QLabel("实验批次/安装编号"), 0, 0)
-        grid.addWidget(self.experiment_id, 0, 1)
-        grid.addWidget(QLabel("实验模式"), 0, 2)
-        grid.addWidget(self.experiment_mode, 0, 3)
+        grid.addWidget(QLabel("实验模式"), 0, 0)
+        grid.addWidget(self.experiment_mode, 0, 1)
         self.load_axis_label = QLabel("加载轴")
         self.branch_label = QLabel("分支")
         self.direction_label = QLabel("方向")
@@ -685,11 +1002,20 @@ class MainWindow(QMainWindow):
         self.cal_pause_btn.clicked.connect(self.pause_calibration)
         self.cal_resume_btn = QPushButton("继续")
         self.cal_resume_btn.clicked.connect(self.resume_calibration)
+        self.force_zero_btn = QPushButton("力归0/卸载")
+        self.force_zero_btn.clicked.connect(self.start_force_zero_unload)
         self.cal_skip_btn = QPushButton("跳过当前点")
         self.cal_skip_btn.clicked.connect(self.skip_calibration_point)
         self.cal_stop_btn = QPushButton("停止/急停")
         self.cal_stop_btn.clicked.connect(lambda: self.stop_calibration("人工停止"))
-        for button in (self.cal_start_btn, self.cal_pause_btn, self.cal_resume_btn, self.cal_skip_btn, self.cal_stop_btn):
+        for button in (
+            self.cal_start_btn,
+            self.cal_pause_btn,
+            self.cal_resume_btn,
+            self.force_zero_btn,
+            self.cal_skip_btn,
+            self.cal_stop_btn,
+        ):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         self.cal_status = QLabel("标定状态：空闲")
@@ -720,6 +1046,8 @@ class MainWindow(QMainWindow):
     def _build_record_group(self) -> QGroupBox:
         box = QGroupBox("记录与导出")
         form = QFormLayout(box)
+        self.experiment_id = QLineEdit("sensor01_mount01")
+        form.addRow("实验批次/安装编号", self.experiment_id)
         out_row = QHBoxLayout()
         self.output_dir = QLineEdit(str(Path.cwd() / "runs"))
         browse = QPushButton("浏览")
@@ -805,8 +1133,12 @@ class MainWindow(QMainWindow):
             self.mini45_precomp_active
             or self.zero_drift_active
             or self.training_active
+            or self.static_full_active
+            or self._static_full_profile_wait
+            or bool(self.static_full_setup_stage)
             or self.auto_force_active
             or self.auto_force_holding
+            or self.force_zero_active
         )
 
     def _plot_updates_suspended(self) -> bool:
@@ -818,15 +1150,116 @@ class MainWindow(QMainWindow):
             return
         active = self._calibration_active()
         paused = self.calibration_paused and active
+        zero_ready, _reason = self._force_zero_unload_ready()
         self.cal_start_btn.setEnabled(not active and not self.k_ident_active)
         self.cal_start_btn.setText("标定运行中" if active else "开始标定")
-        self.cal_pause_btn.setEnabled(active and not paused and not self.zero_drift_active)
-        self.cal_resume_btn.setEnabled(active and paused)
+        self.cal_pause_btn.setEnabled(active and not paused and not self.zero_drift_active and not self.force_zero_active)
+        self.cal_resume_btn.setEnabled(active and paused and not self.force_zero_active)
+        self.force_zero_btn.setEnabled(zero_ready)
+        self.force_zero_btn.setText("力归0中" if self.force_zero_active else "力归0/卸载")
         self.cal_stop_btn.setEnabled(active)
-        self.cal_skip_btn.setEnabled(active and (self.training_active or self.calibration_mode == "sequence"))
+        self.cal_skip_btn.setEnabled(
+            active and not self.force_zero_active and (self.training_active or self.calibration_mode == "sequence")
+        )
+
+    def _force_zero_unload_ready(self) -> tuple[bool, str]:
+        if self.force_zero_active:
+            return False, "力归0/卸载正在运行"
+        if self.k_ident_active:
+            return False, "K 辨识过程中不能启动力归0/卸载"
+        if self.mini45_precomp_active:
+            return False, "Mini45 预补偿测量过程中不能启动力归0/卸载"
+        if self.zero_drift_active:
+            return False, "零点漂移采集过程中不能启动力归0/卸载"
+        if self._static_full_profile_wait or self.static_full_setup_stage:
+            return False, "全静态标定准备阶段不能启动力归0/卸载"
+        if self.static_full_recovering_mini45:
+            return False, "Mini45 自动重连恢复过程中不能启动力归0/卸载"
+        if self.static_full_recovering_esp32:
+            return False, "ESP32 自动重连恢复过程中不能启动力归0/卸载"
+        if self.static_full_returning_zero:
+            return False, "全静态标定已经在自动卸载回零"
+        if not self.motion:
+            return False, "请先连接 Arduino 电机控制串口"
+        if not self.mini45:
+            return False, "请先连接 Mini45 并确认有实时力数据"
+        if not self.force_control_result or not self.force_control_result.valid:
+            return False, "请先完成有效的 K 自动辨识"
+        now = time.monotonic()
+        if not self.latest_force_sample or self.last_force_time <= 0.0 or now - self.last_force_time > 1.0:
+            return False, "Mini45 最近 1 秒内没有实时力数据"
+        return True, ""
+
+    def start_force_zero_unload(self) -> None:
+        ready, reason = self._force_zero_unload_ready()
+        if not ready:
+            QMessageBox.warning(self, "力归0/卸载", reason)
+            return
+
+        now = time.monotonic()
+        if self.workflow.active and not self.workflow.paused:
+            self.workflow.paused = True
+            self.workflow_pause_started_s = now
+            self._write_workflow_event("force_zero_pause", "paused", "力归0/卸载")
+            self._update_workflow_ui()
+
+        if self.static_full_active:
+            if not self.static_full_paused:
+                self.static_full_paused = True
+                self._save_static_full_checkpoint("paused", "力归0/卸载")
+            self.static_full_status.setText("已暂停，正在执行力归0/卸载")
+            self._update_static_full_buttons()
+
+        if self.training_active and self.training_pause_started_s <= 0.0:
+            self.training_pause_started_s = now
+        if self.static_point_collector:
+            self.static_point_collector.begin(now)
+
+        self.calibration_paused = bool(
+            self.training_active
+            or self.static_full_active
+            or self.calibration_mode
+            or self.workflow.active
+            or self.auto_force_active
+            or self.auto_force_holding
+        )
+        self.stop_auto_force("力归0/卸载准备")
+
+        self.force_zero_active = True
+        if not self.start_auto_force():
+            self.force_zero_active = False
+            self._update_calibration_buttons()
+            return
+
+        self.cal_status.setText("标定状态：力归0/卸载中，完成后保持暂停")
+        self._log("开始力归0/卸载：临时目标 Fx=0, Fy=0, Fz=0，完成后保持暂停")
+        self._update_calibration_buttons()
+
+    def _finish_force_zero_unload(self, reason: str = "完成") -> None:
+        if not self.force_zero_active:
+            return
+        self.force_zero_active = False
+        self.stop_auto_force("")
+        self.calibration_paused = bool(
+            self.training_active
+            or self.static_full_active
+            or self.calibration_mode
+            or self.workflow.active
+        )
+        self.cal_status.setText(f"标定状态：力归0/卸载{reason}，保持暂停")
+        self.motion_status.setText("电机状态：力归0/卸载完成，保持暂停")
+        self._log(f"力归0/卸载{reason}，流程保持暂停")
+        self._update_static_full_buttons()
+        self._update_workflow_ui()
+        self._update_calibration_buttons()
 
     def toggle_esp32(self) -> None:
+        if self.static_full_recovering_esp32:
+            return
         if self.esp32:
+            if self.static_full_active:
+                self._begin_static_full_esp32_recovery("用户请求重新连接 ESP32")
+                return
             self.esp32.stop()
             self.esp32 = None
             self.esp_btn.setText("连接 ESP32")
@@ -850,8 +1283,121 @@ class MainWindow(QMainWindow):
             self.esp32 = None
             QMessageBox.critical(self, "ESP32", str(exc))
 
+    def _start_esp32_reconnect_adapter(self) -> None:
+        port = self.esp_port.currentText()
+        if not port:
+            raise RuntimeError("ESP32 串口为空")
+        adapter = Esp32SerialAdapter(
+            port=port,
+            baud=int(self.esp_baud.currentText()),
+            mode=self._combo_value(self.esp_mode),
+            rate_hz=self.esp_rate.value(),
+        )
+        self.last_cap_time = 0.0
+        self.current_cap_effective_hz = 0.0
+        self.current_cap_profile = ""
+        self.esp32 = adapter
+        adapter.start()
+        self.esp_btn.setText("ESP32 重连中")
+        self.workflow_profile_label.setText("MC1081 配置：ESP32 重连中")
+        try:
+            adapter.set_profile(STATIC_PRECISION.name)
+            self._esp32_reconnect_profile_next_s = time.monotonic() + 2.0
+        except Exception:
+            self._esp32_reconnect_profile_next_s = time.monotonic() + 1.0
+
+    def _begin_static_full_esp32_recovery(self, reason: str) -> None:
+        if not self.static_full_active or self.static_full_recovering_esp32:
+            return
+        self.static_full_recovering_esp32 = True
+        self.static_full_paused = True
+        self.calibration_paused = True
+        self._esp32_reconnect_attempts = 0
+        self._esp32_reconnect_next_s = time.monotonic()
+        self._esp32_reconnect_started_s = time.monotonic()
+        self._esp32_reconnect_adapter_started_s = 0.0
+        self._esp32_reconnect_profile_next_s = 0.0
+        self.stop_auto_force("ESP32 断流，已安全暂停")
+        self.static_point_collector = None
+        if self.esp32:
+            try:
+                self.esp32.stop()
+            except Exception:
+                pass
+        self.esp32 = None
+        self.last_cap_time = 0.0
+        self.current_cap_effective_hz = 0.0
+        self.esp_btn.setEnabled(False)
+        self.static_full_status.setText(
+            f"ESP32 电容数据中断，流程已安全暂停并保留第 {self.sequence_index + 1} 点进度。\n"
+            "正在自动重连；重连后将重新切换静态采集配置并重新采集当前点。"
+        )
+        self._log(f"{reason}；全静态标定已暂停，开始自动重连 ESP32")
+        self._save_static_full_checkpoint("recovering", reason)
+        self._update_static_full_buttons()
+
+    def _update_static_full_esp32_recovery(self) -> None:
+        if not self.static_full_recovering_esp32:
+            return
+        now = time.monotonic()
+        if self.esp32 and self.last_cap_time > 0.0 and now - self.last_cap_time <= 1.0:
+            if self._profile_is_ready(STATIC_PRECISION.name):
+                self.static_full_recovering_esp32 = False
+                self.static_full_paused = False
+                self.calibration_paused = False
+                self.esp_btn.setEnabled(True)
+                self.esp_btn.setText("断开 ESP32")
+                self._log(
+                    f"ESP32 自动重连成功（第 {self._esp32_reconnect_attempts} 次尝试），"
+                    f"从第 {self.sequence_index + 1} 点重新稳定并继续"
+                )
+                self._save_static_full_checkpoint("running", "ESP32 自动重连成功")
+                self._update_static_full_buttons()
+                self.start_next_sequence_target()
+                return
+            if now >= self._esp32_reconnect_profile_next_s:
+                try:
+                    self.esp32.set_profile(STATIC_PRECISION.name)
+                    self._esp32_reconnect_profile_next_s = now + 2.0
+                    self._log(f"ESP32 自动重连：重新请求 {STATIC_PRECISION.name} 配置")
+                except Exception as exc:
+                    self._log(f"ESP32 自动重连：请求静态采集配置失败：{exc}")
+                    self._esp32_reconnect_profile_next_s = now + 2.0
+            self.static_full_status.setText(
+                f"ESP32 已恢复数据，正在等待 {STATIC_PRECISION.name} 配置生效；"
+                f"当前 {self.current_cap_profile or '未确认'}，{self.current_cap_effective_hz:.2f} Hz"
+            )
+            return
+        if self.esp32 and now - self._esp32_reconnect_adapter_started_s > 8.0:
+            try:
+                self.esp32.stop()
+            except Exception:
+                pass
+            self.esp32 = None
+            self._esp32_reconnect_next_s = now + 2.0
+        if self.esp32 or now < self._esp32_reconnect_next_s:
+            return
+        self._esp32_reconnect_attempts += 1
+        try:
+            self._start_esp32_reconnect_adapter()
+            self._esp32_reconnect_adapter_started_s = now
+            self._log(f"ESP32 自动重连：第 {self._esp32_reconnect_attempts} 次尝试已打开串口")
+        except Exception as exc:
+            self.esp32 = None
+            self._esp32_reconnect_next_s = now + min(10.0, 2.0 + self._esp32_reconnect_attempts)
+            self.static_full_status.setText(
+                f"ESP32 自动重连第 {self._esp32_reconnect_attempts} 次失败：{exc}\n"
+                "流程保持暂停，稍后继续重试；也可点击停止并之后从已有实验继续。"
+            )
+            self._log(f"ESP32 自动重连失败：{exc}")
+
     def toggle_mini45(self) -> None:
+        if self.static_full_recovering_mini45:
+            return
         if self.mini45:
+            if self.static_full_active:
+                self._begin_static_full_mini45_recovery("用户请求重新连接 Mini45")
+                return
             if self.mini45_precomp_active:
                 self.finish_mini45_precomp("Mini45 已断开")
             elif self.mini45_precomp_enabled:
@@ -936,6 +1482,110 @@ class MainWindow(QMainWindow):
             self.mini45 = None
             QMessageBox.critical(self, "Mini45", str(exc))
 
+    def _start_mini45_reconnect_adapter(self) -> None:
+        mini_mode = self._combo_value(self.mini_mode)
+        if mini_mode == "simulator":
+            adapter = Mini45Simulator(rate_hz=100)
+        else:
+            ip = self.mini_ip.text().strip()
+            if not ip:
+                raise RuntimeError("Mini45 IP 地址为空")
+            force_cpu = getattr(self, "_mini45_cfgcpf", None)
+            torque_cpu = getattr(self, "_mini45_cfgcpt", None)
+            if force_cpu is None or torque_cpu is None:
+                config = fetch_netft_config(ip)
+                force_cpu = float(config["cfgcpf"])
+                torque_cpu = float(config["cfgcpt"])
+                self._mini45_cfgcpf = force_cpu
+                self._mini45_cfgcpt = torque_cpu
+            adapter = Mini45NetFTAdapter(
+                ip=ip,
+                port=self.mini_port.value(),
+                force_counts_per_unit=float(force_cpu),
+                torque_counts_per_unit=float(torque_cpu),
+            )
+        self.last_force_time = 0.0
+        self.latest_force_sample = None
+        self.reset_force_filter(log=False)
+        self.mini45 = adapter
+        adapter.start()
+        self.mini_btn.setText("Mini45 重连中")
+        self.mini_status.setText("Mini45 状态：自动重连后等待第一帧数据")
+
+    def _begin_static_full_mini45_recovery(self, reason: str) -> None:
+        if not self.static_full_active or self.static_full_recovering_mini45 or self.static_full_recovering_esp32:
+            return
+        self.static_full_recovering_mini45 = True
+        self.static_full_paused = True
+        self.calibration_paused = True
+        self._mini45_reconnect_attempts = 0
+        self._mini45_reconnect_next_s = time.monotonic()
+        self._mini45_reconnect_started_s = time.monotonic()
+        self._mini45_reconnect_adapter_started_s = 0.0
+        self.stop_auto_force("Mini45 断流，已安全暂停")
+        self.static_point_collector = None
+        self.buffer.clear()
+        self.reset_force_filter(log=False)
+        if self.mini45:
+            try:
+                self.mini45.stop()
+            except Exception:
+                pass
+        self.mini45 = None
+        self.last_force_time = 0.0
+        self.latest_force_sample = None
+        self.mini_btn.setEnabled(False)
+        self.static_full_status.setText(
+            f"Mini45 数据中断，流程已安全暂停并保留第 {self.sequence_index + 1} 点进度。\n"
+            "正在自动重连；重连后将恢复原预补偿并重新采集当前点。"
+        )
+        self._log(f"{reason}；全静态标定已暂停，开始自动重连 Mini45，原预补偿保持有效")
+        self._save_static_full_checkpoint("recovering", reason)
+        self._update_static_full_buttons()
+
+    def _update_static_full_mini45_recovery(self) -> None:
+        if not self.static_full_recovering_mini45:
+            return
+        now = time.monotonic()
+        if self.mini45 and self.last_force_time > 0.0 and now - self.last_force_time <= 1.0:
+            self.static_full_recovering_mini45 = False
+            self.static_full_paused = False
+            self.calibration_paused = False
+            self.mini_btn.setEnabled(True)
+            self.mini_btn.setText("断开 Mini45")
+            self.mini_status.setText("Mini45 状态：自动重连成功，数据正常")
+            compensation = "已恢复原预补偿" if self.mini45_precomp_enabled else "当前未启用软件预补偿"
+            self._log(
+                f"Mini45 自动重连成功（第 {self._mini45_reconnect_attempts} 次尝试），{compensation}；"
+                f"从第 {self.sequence_index + 1} 点重新稳定并继续"
+            )
+            self._save_static_full_checkpoint("running", "Mini45 自动重连成功")
+            self._update_static_full_buttons()
+            self.start_next_sequence_target()
+            return
+        if self.mini45 and now - self._mini45_reconnect_adapter_started_s > 5.0:
+            try:
+                self.mini45.stop()
+            except Exception:
+                pass
+            self.mini45 = None
+            self._mini45_reconnect_next_s = now + 2.0
+        if self.mini45 or now < self._mini45_reconnect_next_s:
+            return
+        self._mini45_reconnect_attempts += 1
+        try:
+            self._start_mini45_reconnect_adapter()
+            self._mini45_reconnect_adapter_started_s = now
+            self._log(f"Mini45 自动重连：第 {self._mini45_reconnect_attempts} 次尝试已发送 RDT 启动命令")
+        except Exception as exc:
+            self.mini45 = None
+            self._mini45_reconnect_next_s = now + min(10.0, 2.0 + self._mini45_reconnect_attempts)
+            self.static_full_status.setText(
+                f"Mini45 自动重连第 {self._mini45_reconnect_attempts} 次失败：{exc}\n"
+                "流程保持暂停，稍后继续重试；也可点击停止并之后从已有实验继续。"
+            )
+            self._log(f"Mini45 自动重连失败：{exc}")
+
     def bias_mini45(self) -> None:
         if self.mini45_precomp_active or self.auto_force_active or self.k_ident_active or self.zero_drift_active or self.training_active:
             QMessageBox.warning(self, "Mini45", "预补偿、自动标定、K 辨识、零点漂移或训练采集过程中不能清零/偏置")
@@ -952,7 +1602,14 @@ class MainWindow(QMainWindow):
     def start_mini45_precomp(self) -> None:
         if self.mini45_precomp_active:
             return
-        if self.workflow.active or self._calibration_active() or self.k_ident_active:
+        if (
+            self.workflow.active
+            or (
+                self._calibration_active()
+                and self.static_full_setup_stage not in {"precomp", "retest_precomp"}
+            )
+            or self.k_ident_active
+        ):
             QMessageBox.warning(self, "Mini45 预补偿", "当前有实验、力控或 K 辨识正在运行")
             return
         now = time.monotonic()
@@ -1048,6 +1705,33 @@ class MainWindow(QMainWindow):
             self.mini45_precomp_status.setText(f"预补偿：失败，{reason}")
             self._log(f"Mini45 预补偿失败：{reason}。请保持空载静止后重新测量。")
 
+        if self.static_full_setup_stage == "precomp":
+            if not self.mini45_precomp_enabled:
+                self._abort_static_full_setup("Mini45 零点预补偿质量检查未通过")
+                return
+            self.static_full_setup_stage = "k_identification"
+            self.static_full_status.setText("自动准备 2/3：正在自动辨识 K")
+            self._update_static_full_buttons()
+            self._log("Mini45 零点预补偿完成，开始自动辨识 K")
+            self.start_k_identification()
+            if not self.k_ident_active:
+                self._abort_static_full_setup("K 自动辨识未能启动")
+
+        if self.static_full_setup_stage == "retest_precomp":
+            if not self.mini45_precomp_enabled:
+                self.stop_static_full_retest("Mini45 零点预补偿质量检查未通过")
+                return
+            if self.recorder:
+                self.recorder.update_static_full_retest_manifest(
+                    mini45_precomp_source="remeasure",
+                    mini45_precomp_quality=self.mini45_precomp_quality,
+                    mini45_precomp_bias=dict(self.mini45_precomp_bias),
+                )
+            if self.static_full_retest_remeasure_k:
+                self._start_static_full_retest_k_identification()
+            else:
+                self._start_static_full_retest_profile_wait()
+
     def _invalidate_mini45_precomp(self, reason: str) -> None:
         self.mini45_precomp_active = False
         self.mini45_precomp_enabled = False
@@ -1080,6 +1764,8 @@ class MainWindow(QMainWindow):
             values.clear()
         for curve in self.force_curves.values():
             curve.setData([], [])
+        self.force_plot_dirty = False
+        self.pending_force_plot_sample = None
         self.last_force_plot_update_s = 0.0
 
     def toggle_motion(self) -> None:
@@ -1298,6 +1984,11 @@ class MainWindow(QMainWindow):
         self._update_calibration_buttons()
         if self.workflow.active and self.workflow.stage == "k_identification":
             self.abort_full_workflow(f"K 辨识失败：{reason}")
+        elif self.static_full_setup_stage == "k_identification":
+            self._abort_static_full_setup(f"K 辨识失败：{reason}")
+
+        if self.static_full_setup_stage == "retest_k_identification":
+            self.stop_static_full_retest(f"K 辨识失败：{reason}")
 
     def _force_sample_window(self, seconds: float):
         return force_stats(self.buffer.window(time.monotonic(), seconds))
@@ -1420,7 +2111,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "K 辨识", f"K 辨识无效：{result.reject_reason}")
             if self.workflow.active and self.workflow.stage == "k_identification":
                 self.abort_full_workflow(f"K 辨识无效：{result.reject_reason}")
+        if self.static_full_setup_stage == "k_identification":
+            if result.valid:
+                self._log("K 自动辨识完成，准备切换静态电容采集配置")
+                self._save_static_full_checkpoint("setup_complete", "预补偿和 K 辨识完成")
+                self._start_static_full_profile_wait()
+            else:
+                self._abort_static_full_setup(f"K 辨识无效：{result.reject_reason}")
         self._update_calibration_buttons()
+
+        if self.static_full_setup_stage == "retest_k_identification":
+            if result.valid:
+                if self.recorder:
+                    self.recorder.update_static_full_retest_manifest(force_control_source="remeasure")
+                self._start_static_full_retest_profile_wait()
+            else:
+                self.stop_static_full_retest(f"K 辨识无效：{result.reject_reason}")
 
     def update_k_display(self, result=None) -> None:
         result = result or self.force_control_result
@@ -1476,6 +2182,8 @@ class MainWindow(QMainWindow):
         profile_name: str | None = None,
     ) -> None:
         if not self.recorder:
+            return
+        if self.static_full_retest_active:
             return
         profile_label = profile_name or self.current_cap_profile
         profile = None
@@ -1567,6 +2275,8 @@ class MainWindow(QMainWindow):
 
     def resume_full_workflow(self) -> None:
         if not self.workflow.active:
+            return
+        if self.force_zero_active:
             return
         now = time.monotonic()
         paused_s = max(0.0, now - self.workflow_pause_started_s)
@@ -1720,8 +2430,8 @@ class MainWindow(QMainWindow):
             return
         active = self.workflow.active
         self.workflow_start_btn.setEnabled(not active)
-        self.workflow_pause_btn.setEnabled(active and not self.workflow.paused)
-        self.workflow_resume_btn.setEnabled(active and self.workflow.paused)
+        self.workflow_pause_btn.setEnabled(active and not self.workflow.paused and not self.force_zero_active)
+        self.workflow_resume_btn.setEnabled(active and self.workflow.paused and not self.force_zero_active)
         self.workflow_stop_btn.setEnabled(active)
         self.workflow_balanced_enabled.setEnabled(not active)
         self.workflow_fast_enabled.setEnabled(not active)
@@ -1852,6 +2562,1088 @@ class MainWindow(QMainWindow):
         if mode == "combined":
             self.start_training_collection()
 
+    # ── 全静态标定 ────────────────────────────────────────────
+
+    def _static_full_busy(self) -> bool:
+        return bool(
+            self.static_full_active
+            or self.static_full_retest_active
+            or self._static_full_profile_wait
+            or self.static_full_setup_stage
+        )
+
+    def _update_static_full_buttons(self) -> None:
+        active = self._static_full_busy()
+        paused = self.static_full_paused
+        self.static_full_start_btn.setEnabled(not active)
+        self.static_full_resume_file_btn.setEnabled(not active)
+        self.static_full_pause_btn.setEnabled(
+            self.static_full_active
+            and not paused
+            and not self.static_full_returning_zero
+            and not self.static_full_recovering_mini45
+            and not self.static_full_recovering_esp32
+            and not self.force_zero_active
+        )
+        self.static_full_resume_btn.setEnabled(
+            self.static_full_active
+            and paused
+            and not self.static_full_recovering_mini45
+            and not self.static_full_recovering_esp32
+            and not self.force_zero_active
+        )
+        self.static_full_stop_btn.setEnabled(active)
+        for w in (self.static_full_fz_max, self.static_full_fz_step,
+                  self.static_full_preload_levels,
+                  self.static_full_shear_max, self.static_full_shear_step,
+                  self.static_full_angles, self.static_full_cap_samples):
+            w.setEnabled(not active)
+        if hasattr(self, "static_full_flow_checks"):
+            for check in self.static_full_flow_checks.values():
+                check.setEnabled(not active)
+            for flow, cycles in self.static_full_flow_cycles.items():
+                cycles.setEnabled(not active and self.static_full_flow_checks[flow].isChecked())
+        if hasattr(self, "static_full_retest_start_btn"):
+            loaded = bool(self.static_full_retest_source_targets)
+            self.static_full_retest_load_btn.setEnabled(not active)
+            self.static_full_retest_start_btn.setEnabled(not active and loaded)
+            self.static_full_retest_pause_btn.setEnabled(
+                self.static_full_retest_active
+                and self.static_full_active
+                and not paused
+                and not self.static_full_returning_zero
+                and not self.force_zero_active
+            )
+            self.static_full_retest_resume_btn.setEnabled(
+                self.static_full_retest_active
+                and self.static_full_active
+                and paused
+                and not self.force_zero_active
+            )
+            self.static_full_retest_stop_btn.setEnabled(self.static_full_retest_active)
+            for widget in (
+                *self.static_full_retest_axis_checks.values(),
+                *self.static_full_retest_branch_checks.values(),
+                *self.static_full_retest_direction_checks.values(),
+                self.static_full_retest_cycles,
+                self.static_full_retest_preloads,
+                self.static_full_retest_shear_levels,
+                self.static_full_retest_angles,
+                self.static_full_retest_reprecomp,
+                self.static_full_retest_rek,
+            ):
+                widget.setEnabled(not active)
+
+    def _devices_ready(self, *, require_k: bool = True) -> bool:
+        if not self.esp32:
+            QMessageBox.warning(self, "全静态标定", "请先连接 ESP32 电容采集串口")
+            return False
+        if not self.mini45:
+            QMessageBox.warning(self, "全静态标定", "请先连接 Mini45")
+            return False
+        if not self.motion:
+            QMessageBox.warning(self, "全静态标定", "请先连接 Arduino 电机控制串口")
+            return False
+        if require_k and (not self.force_control_result or not self.force_control_result.valid):
+            QMessageBox.warning(self, "全静态标定", "请先在「实验配置」页完成 K 自动辨识")
+            return False
+        if self._combo_value(self.esp_mode) != "stream":
+            QMessageBox.warning(self, "全静态标定", "全静态标定要求 ESP32 使用流式采集模式")
+            return False
+        now = time.monotonic()
+        if not self.latest_force_sample or self.last_force_time <= 0.0 or now - self.last_force_time > 1.0:
+            QMessageBox.warning(self, "全静态标定", "Mini45 最近 1 秒内没有有效力数据")
+            return False
+        if not self._current_force_safe():
+            QMessageBox.warning(self, "全静态标定", "当前力或力矩超过安全限值")
+            return False
+        try:
+            self.current_force_frame_mapping().validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "全静态标定", f"传感器坐标映射无效：{exc}")
+            return False
+        return True
+
+    def _checked_values_or_none(self, checks: dict[str, QCheckBox]) -> set[str] | None:
+        selected = {value for value, check in checks.items() if check.isChecked()}
+        if not selected or len(selected) == len(checks):
+            return None
+        return selected
+
+    def _optional_force_levels(self, text: str) -> set[float] | None:
+        text = text.strip()
+        return set(parse_force_levels(text)) if text else None
+
+    def _optional_angles(self, text: str) -> set[float] | None:
+        text = text.strip()
+        return set(parse_angles_deg(text)) if text else None
+
+    def _optional_cycles(self, text: str) -> set[int] | None:
+        text = text.strip()
+        if not text:
+            return None
+        values = {int(value) for value in parse_force_levels(text)}
+        if any(value < 1 for value in values):
+            raise ValueError("cycle index must be >= 1")
+        return values
+
+    def _static_full_retest_filters(self) -> dict:
+        return {
+            "axes": self._checked_values_or_none(self.static_full_retest_axis_checks),
+            "branches": self._checked_values_or_none(self.static_full_retest_branch_checks),
+            "directions": self._checked_values_or_none(self.static_full_retest_direction_checks),
+            "cycles": self._optional_cycles(self.static_full_retest_cycles.text()),
+            "preload_levels": self._optional_force_levels(self.static_full_retest_preloads.text()),
+            "shear_levels": self._optional_force_levels(self.static_full_retest_shear_levels.text()),
+            "diagonal_angles_deg": self._optional_angles(self.static_full_retest_angles.text()),
+        }
+
+    def _static_full_retest_filter_manifest(self, filters: dict) -> dict:
+        return {
+            key: sorted(value) if isinstance(value, set) else value
+            for key, value in filters.items()
+        }
+
+    def _filtered_static_full_retest_targets(self) -> list[CalibrationTarget]:
+        filters = self._static_full_retest_filters()
+        self.static_full_retest_filter_spec = self._static_full_retest_filter_manifest(filters)
+        existing = filter_static_full_targets(self.static_full_retest_source_targets, **filters)
+        generated = generate_missing_static_full_diagonal_targets(
+            self.static_full_retest_source_targets,
+            **filters,
+        )
+        return existing + generated
+
+    def _update_static_full_retest_preview(self, *args: object) -> None:
+        if not hasattr(self, "static_full_retest_status"):
+            return
+        if not self.static_full_retest_source_targets:
+            self.static_full_retest_status.setText("未加载补测批次")
+            self._update_static_full_buttons()
+            return
+        try:
+            targets = self._filtered_static_full_retest_targets()
+        except Exception as exc:
+            self.static_full_retest_status.setText(f"筛选条件无效：{exc}")
+            self.static_full_retest_status.setStyleSheet("color: #C62828;")
+            self._update_static_full_buttons()
+            return
+        self.static_full_retest_status.setStyleSheet("")
+        fz_n = sum(1 for target in targets if target.axis == "Fz")
+        fx_n = sum(1 for target in targets if target.axis == "Fx")
+        fy_n = sum(1 for target in targets if target.axis == "Fy")
+        diag_n = sum(1 for target in targets if target.axis == "combined")
+        self.static_full_retest_status.setText(
+            f"已加载 {len(self.static_full_retest_source_targets)} 个原始目标；当前筛选 {len(targets)} 个补测点 "
+            f"(Fz {fz_n} / Fx {fx_n} / Fy {fy_n} / 斜向 {diag_n})"
+        )
+        self._update_static_full_buttons()
+
+    def _apply_force_frame_mapping_row(self, row: dict | None) -> None:
+        if not row:
+            return
+        for sensor_axis in ("Fx", "Fy", "Fz"):
+            source = row.get(f"sensor_{sensor_axis}_from")
+            sign = row.get(f"sensor_{sensor_axis}_sign")
+            if source not in (None, ""):
+                self._set_combo_by_data(self.frame_axis_combos[sensor_axis], str(source))
+            if sign not in (None, ""):
+                self._set_combo_by_data(self.frame_sign_combos[sensor_axis], str(sign))
+        self.on_force_frame_mapping_changed()
+
+    def _apply_static_full_parameters(self, saved_parameters: dict | None) -> None:
+        if not isinstance(saved_parameters, dict):
+            return
+        self.static_full_fz_max.setValue(float(saved_parameters["fz_max"]))
+        self.static_full_fz_step.setValue(float(saved_parameters["fz_step"]))
+        self.static_full_preload_levels.setText(
+            ",".join(f"{float(value):g}" for value in saved_parameters["preload_levels"])
+        )
+        self.static_full_shear_max.setValue(float(saved_parameters["shear_max"]))
+        self.static_full_shear_step.setValue(float(saved_parameters["shear_step"]))
+        self.static_full_angles.setText(
+            ",".join(f"{float(value):g}" for value in saved_parameters["angles_deg"])
+        )
+        self.static_full_cap_samples.setValue(int(saved_parameters.get("required_cap_samples", 45)))
+        legacy_cycles = int(saved_parameters.get("cycles", 3))
+        enabled_flows = set(saved_parameters.get("enabled_flows") or STATIC_FULL_FLOWS)
+        flow_cycles = saved_parameters.get("flow_cycles") or {}
+        if hasattr(self, "static_full_flow_checks"):
+            for flow in STATIC_FULL_FLOWS:
+                self.static_full_flow_checks[flow].setChecked(flow in enabled_flows)
+                self.static_full_flow_cycles[flow].setValue(int(flow_cycles.get(flow, legacy_cycles)))
+            self._update_static_full_flow_controls()
+
+    def _load_static_full_batch_document(self, folder: Path) -> tuple[dict, list[CalibrationTarget]]:
+        if checkpoint_path(folder).exists():
+            document = load_checkpoint(folder)
+            targets = [CalibrationTarget(**row) for row in document["targets"]]
+            return document, targets
+        parameters = self._static_full_parameters()
+        targets = self._static_full_targets_from_parameters(parameters)
+        completed = legacy_completed_point_count(folder)
+        return {
+            "status": "legacy",
+            "parameters": parameters,
+            "targets": [asdict(target) for target in targets],
+            "sequence_index": completed,
+            "completed_points": completed,
+            "invalid_points": 0,
+            "marker_id": legacy_last_marker_id(folder),
+            "force_frame_mapping": load_last_force_mapping(folder),
+            "force_control_result": None,
+            "mini45_precomp": None,
+        }, targets
+
+    def load_static_full_retest_folder(self) -> None:
+        if self._static_full_busy() or self.workflow.active or self.k_ident_active or self._calibration_active():
+            QMessageBox.warning(self, "全静态补测", "当前已有实验或标定流程正在运行")
+            return
+        folder_text = QFileDialog.getExistingDirectory(self, "选择已有全静态实验目录", self.output_dir.text())
+        if not folder_text:
+            return
+        folder = Path(folder_text)
+        try:
+            document, targets = self._load_static_full_batch_document(folder)
+            safety = SafetySettings()
+            validate_force_targets(targets, (safety.fx_abs_max_n, safety.fy_abs_max_n, safety.fz_abs_max_n))
+            self._apply_static_full_parameters(document.get("parameters"))
+            self._apply_force_frame_mapping_row(document.get("force_frame_mapping"))
+        except Exception as exc:
+            QMessageBox.warning(self, "全静态补测", f"无法读取已有实验：{exc}")
+            return
+
+        k_payload = document.get("force_control_result")
+        try:
+            restored_k = KIdentificationResult(**k_payload) if isinstance(k_payload, dict) else load_last_valid_k_result(folder)
+        except Exception:
+            restored_k = None
+        if restored_k and restored_k.valid:
+            self.force_control_result = restored_k
+            self.force_control_state = DecoupledControlState()
+            self.update_k_display(restored_k)
+            self.static_full_retest_k_source = "checkpoint" if isinstance(k_payload, dict) else "force_control_k.csv"
+        elif not self.static_full_retest_rek.isChecked():
+            QMessageBox.warning(self, "全静态补测", "已有实验中没有可复用的有效 K；请勾选重新辨识 K 后再加载")
+            return
+        else:
+            self.clear_force_control_k()
+            self.static_full_retest_k_source = "remeasure"
+
+        precomp_payload = document.get("mini45_precomp")
+        if isinstance(precomp_payload, dict) and precomp_payload.get("enabled"):
+            try:
+                restored_bias = {field: float(precomp_payload["bias"][field]) for field in ZERO_BIAS}
+                restored_quality = str(precomp_payload.get("quality") or "warning")
+                self.static_full_retest_precomp_source = "checkpoint"
+            except Exception as exc:
+                QMessageBox.warning(self, "全静态补测", f"Mini45 预补偿记录无效：{exc}")
+                return
+        else:
+            legacy_precomp = load_latest_precomp(folder)
+            if legacy_precomp:
+                restored_bias, restored_quality = legacy_precomp
+                self.static_full_retest_precomp_source = "mini45_precomp_summary"
+            elif not self.static_full_retest_reprecomp.isChecked():
+                QMessageBox.warning(self, "全静态补测", "已有实验中没有可复用的 Mini45 预补偿；请勾选重新做预补偿后再加载")
+                return
+            else:
+                restored_bias, restored_quality = dict(ZERO_BIAS), "remeasure"
+                self.static_full_retest_precomp_source = "remeasure"
+
+        if self.static_full_retest_precomp_source != "remeasure":
+            self.mini45_precomp_enabled = True
+            self.mini45_precomp_active = False
+            self.mini45_precomp_bias = dict(restored_bias)
+            self.mini45_precomp_quality = restored_quality
+            self.mini45_precomp_status.setText(
+                f"预补偿：已从补测源批次恢复（{restored_quality}）\n"
+                f"{self._mini45_precomp_bias_text(self.mini45_precomp_bias)}"
+            )
+
+        self.static_full_retest_folder = folder
+        self.static_full_retest_document = document
+        self.static_full_retest_source_targets = targets
+        self.static_full_retest_source_experiment_id = str(document.get("experiment_id") or self.experiment_id.text().strip() or "exp001")
+        self.static_full_retest_folder_text.setText(str(folder))
+        self.output_dir.setText(str(folder.parent))
+        self.experiment_id.setText(self.static_full_retest_source_experiment_id)
+        self._update_force_frame_mapping_lock()
+        self._update_static_full_retest_preview()
+        self._log(f"已加载全静态补测源批次：{folder}，目标 {len(targets)} 个")
+
+    def start_static_full(self) -> None:
+        if self._static_full_busy():
+            return
+        if self.workflow.active or self._calibration_active() or self.k_ident_active or self.calibration_mode:
+            QMessageBox.warning(self, "全静态标定", "当前已有实验、标定或 K 辨识流程正在运行")
+            return
+        if not self._devices_ready(require_k=False):
+            return
+        if self.recorder:
+            QMessageBox.warning(self, "全静态标定", "请先结束当前实验批次；全静态流程会自动创建并管理独立批次")
+            return
+        try:
+            parameters = self._static_full_parameters()
+            targets = self._static_full_targets_from_parameters(parameters)
+            safety = SafetySettings()
+            validate_force_targets(
+                targets,
+                (safety.fx_abs_max_n, safety.fy_abs_max_n, safety.fz_abs_max_n),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "全静态标定", f"参数错误：{exc}")
+            return
+        if not targets:
+            QMessageBox.warning(self, "全静态标定", "请至少勾选一个测量流程")
+            return
+
+        self.toggle_recording()
+        if not self.recorder:
+            return
+        self.static_full_auto_recording = True
+        self._static_full_pending_targets = targets
+        self.static_full_setup_stage = "precomp"
+        self.static_full_status.setText("自动准备 1/3：Mini45 零点预补偿测量中（60 s）")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self._log("全静态标定自动准备：已创建实验批次，开始 Mini45 零点预补偿")
+        self.start_mini45_precomp()
+        if not self.mini45_precomp_active:
+            self._abort_static_full_setup("Mini45 零点预补偿未能启动")
+
+    def _static_full_retest_target_rows(self, targets: list[CalibrationTarget]) -> list[dict]:
+        rows = []
+        for target in targets:
+            row = asdict(target)
+            row["shear_N"] = static_full_target_shear_n(target)
+            angle = static_full_target_angle_deg(target)
+            row["angle_deg"] = "" if angle is None else angle
+            rows.append(row)
+        return rows
+
+    def start_static_full_retest(self) -> None:
+        if self._static_full_busy() or self.workflow.active or self.k_ident_active or self._calibration_active():
+            QMessageBox.warning(self, "全静态补测", "当前已有实验或标定流程正在运行")
+            return
+        if not self.static_full_retest_folder or not self.static_full_retest_source_targets:
+            QMessageBox.warning(self, "全静态补测", "请先选择已有全静态批次")
+            return
+        try:
+            targets = self._filtered_static_full_retest_targets()
+            safety = SafetySettings()
+            validate_force_targets(targets, (safety.fx_abs_max_n, safety.fy_abs_max_n, safety.fz_abs_max_n))
+        except Exception as exc:
+            QMessageBox.warning(self, "全静态补测", f"筛选条件无效：{exc}")
+            return
+        if not targets:
+            QMessageBox.warning(self, "全静态补测", "当前筛选条件没有匹配任何补测点")
+            return
+        self.static_full_retest_remeasure_precomp = self.static_full_retest_reprecomp.isChecked()
+        self.static_full_retest_remeasure_k = self.static_full_retest_rek.isChecked()
+        if self.static_full_retest_remeasure_precomp and not self.static_full_retest_remeasure_k:
+            self.static_full_retest_remeasure_k = True
+            self.static_full_retest_rek.setChecked(True)
+        if not self._devices_ready(require_k=not self.static_full_retest_remeasure_k):
+            return
+        if self.recorder:
+            QMessageBox.warning(self, "全静态补测", "请先结束当前实验批次；补测会自动打开原批次目录")
+            return
+
+        folder = self.static_full_retest_folder
+        retest_id = time.strftime("%Y%m%d_%H%M%S")
+        manifest = {
+            "source_batch_dir": str(folder),
+            "source_experiment_id": self.static_full_retest_source_experiment_id,
+            "source_checkpoint_status": self.static_full_retest_document.get("status", ""),
+            "filters": dict(self.static_full_retest_filter_spec),
+            "target_count": len(targets),
+            "targets": self._static_full_retest_target_rows(targets),
+            "force_frame_mapping": self.current_force_frame_mapping().as_row("", self.static_full_retest_source_experiment_id),
+            "force_control_source": "remeasure" if self.static_full_retest_remeasure_k else self.static_full_retest_k_source,
+            "mini45_precomp_source": "remeasure" if self.static_full_retest_remeasure_precomp else self.static_full_retest_precomp_source,
+            "required_cap_samples": self._static_full_required_cap_samples(),
+            "completed_points": 0,
+            "invalid_points": 0,
+        }
+        try:
+            recorder = CsvRecorder(folder)
+            recorder.start(resume=True)
+            recorder.start_static_full_retest(retest_id=retest_id, manifest=manifest)
+        except Exception as exc:
+            QMessageBox.warning(self, "全静态补测", f"无法打开补测输出文件：{exc}")
+            return
+
+        self.recorder = recorder
+        self.static_full_auto_recording = True
+        self.static_full_retest_active = True
+        self.static_full_retest_id = retest_id
+        self.static_full_retest_targets = targets
+        self._static_full_pending_targets = targets
+        self._static_full_pending_resume = None
+        self.static_full_points_completed = 0
+        self.static_full_points_invalid = 0
+        self.marker_id = 0
+        self.buffer.clear()
+        self.reset_force_filter(log=False)
+        self.record_btn.setText("结束实验批次")
+        self.record_status.setText(str(folder))
+        self._update_force_frame_mapping_lock()
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self._log(f"全静态补测开始准备：{folder}，补测点 {len(targets)} 个，retest_id={retest_id}")
+
+        if self.static_full_retest_remeasure_precomp:
+            self.static_full_setup_stage = "retest_precomp"
+            self.static_full_retest_status.setText("补测准备 1/3：Mini45 零点预补偿测量中（60 s）")
+            self.static_full_status.setText("补测准备：Mini45 零点预补偿测量中")
+            self.start_mini45_precomp()
+            if not self.mini45_precomp_active:
+                self.stop_static_full_retest("Mini45 零点预补偿未能启动")
+            return
+        if self.static_full_retest_remeasure_k:
+            self._start_static_full_retest_k_identification()
+            return
+        self._start_static_full_retest_profile_wait()
+
+    def _start_static_full_retest_k_identification(self) -> None:
+        self.static_full_setup_stage = "retest_k_identification"
+        self.static_full_status.setText("补测准备：正在自动辨识 K")
+        self.static_full_retest_status.setText("补测准备：正在自动辨识 K")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self.start_k_identification()
+        if not self.k_ident_active:
+            self.stop_static_full_retest("K 自动辨识未能启动")
+
+    def _start_static_full_retest_profile_wait(self) -> None:
+        self.static_full_setup_stage = "retest_profile"
+        self._static_full_profile_wait = True
+        self._static_full_profile_start_s = time.monotonic()
+        self.static_full_status.setText(f"补测准备：等待 {STATIC_PRECISION.name} 配置生效")
+        self.static_full_retest_status.setText(f"补测准备：等待 {STATIC_PRECISION.name} 配置生效")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        try:
+            self._request_cap_profile(STATIC_PRECISION.name)
+        except Exception as exc:
+            self._static_full_profile_wait = False
+            self.stop_static_full_retest(f"切换 MC1081 配置失败：{exc}")
+
+    def _static_full_retest_begin(self) -> None:
+        targets = list(self._static_full_pending_targets or self.static_full_retest_targets)
+        self._static_full_pending_targets = []
+        self._static_full_pending_resume = None
+        self.static_full_setup_stage = ""
+        self.static_full_active = True
+        self.static_full_paused = False
+        self.static_full_returning_zero = False
+        self.static_full_recovering_mini45 = False
+        self.static_full_recovering_esp32 = False
+        self.static_full_points_completed = 0
+        self.static_full_points_invalid = 0
+        self.sequence_targets = targets
+        self.sequence_index = 0
+        self.calibration_mode = "static_full_retest"
+        self.calibration_paused = False
+        self.static_full_status.setText(f"补测运行中 — 共 {len(targets)} 个补测点")
+        self.static_full_retest_status.setText(f"补测运行中 — 共 {len(targets)} 个补测点")
+        if self.recorder:
+            self.recorder.update_static_full_retest_manifest(status="running", run_started_at=utc_timestamp())
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self._log(f"全静态补测正式开始：{len(targets)} 个补测点")
+        self.start_next_sequence_target()
+
+    def stop_static_full_retest(self, reason: str = "补测停止") -> None:
+        if not self.static_full_retest_active:
+            return
+        self.static_full_setup_stage = ""
+        self._static_full_profile_wait = False
+        if self.mini45_precomp_active:
+            self.finish_mini45_precomp(reason)
+        if self.k_ident_active:
+            self.abort_k_identification(reason)
+        self.stop_auto_force(reason)
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        if self.recorder:
+            self.recorder.finish_static_full_retest(
+                status="stopped",
+                reason=reason,
+                completed_points=self.static_full_points_completed,
+                invalid_points=self.static_full_points_invalid,
+            )
+        self._reset_static_full_retest_runtime()
+        self.static_full_status.setText(f"补测已停止：{reason}")
+        if hasattr(self, "static_full_retest_status"):
+            self.static_full_retest_status.setText(f"补测已停止：{reason}")
+        self._close_static_full_recording()
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+
+    def _finish_static_full_retest(self) -> None:
+        total = len(self.sequence_targets)
+        self.stop_auto_force("")
+        if self.recorder:
+            self.recorder.finish_static_full_retest(
+                status="completed",
+                reason="补测点完成并已回零",
+                completed_points=self.static_full_points_completed,
+                invalid_points=self.static_full_points_invalid,
+            )
+        self._reset_static_full_retest_runtime()
+        text = (
+            f"补测完成 — {self.static_full_points_completed} 有效 / "
+            f"{self.static_full_points_invalid} 无效 / 共 {total} 点，已自动卸载回零"
+        )
+        self.static_full_status.setText(text)
+        if hasattr(self, "static_full_retest_status"):
+            self.static_full_retest_status.setText(text)
+        self.cal_status.setText("标定状态：全静态补测完成，已卸载回零")
+        self._log(text)
+        self._close_static_full_recording()
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+
+    def _reset_static_full_retest_runtime(self) -> None:
+        self.static_full_retest_active = False
+        self.static_full_retest_targets = []
+        self.static_full_retest_id = ""
+        self.static_full_active = False
+        self.static_full_paused = False
+        self.static_full_returning_zero = False
+        self.static_full_recovering_mini45 = False
+        self.static_full_recovering_esp32 = False
+        self.static_full_setup_stage = ""
+        self._static_full_profile_wait = False
+        self._static_full_pending_targets = []
+        self._static_full_pending_resume = None
+        self.calibration_mode = ""
+        self.calibration_paused = False
+        self.static_point_collector = None
+        self.sequence_targets = []
+        self.sequence_index = 0
+        self.active_target = None
+        self.static_full_retest_remeasure_precomp = False
+        self.static_full_retest_remeasure_k = False
+
+    def _start_static_full_profile_wait(self) -> None:
+        self.static_full_setup_stage = "profile"
+        self._static_full_profile_wait = True
+        self._static_full_profile_start_s = time.monotonic()
+        self.static_full_status.setText(f"自动准备 3/3：等待 {STATIC_PRECISION.name} 配置生效")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        try:
+            self._request_cap_profile(STATIC_PRECISION.name)
+        except Exception as exc:
+            self._static_full_profile_wait = False
+            self._abort_static_full_setup(f"切换 MC1081 配置失败：{exc}")
+            return
+        self._log(f"全静态标定：等待 MC1081 切换到 {STATIC_PRECISION.name} 配置（超时 15s）")
+
+    def _close_static_full_recording(self) -> None:
+        if self.static_full_auto_recording and self.recorder:
+            self.recorder.stop()
+            self.recorder = None
+            self.record_btn.setText("开始实验批次")
+            self.record_status.setText("未开始实验批次")
+            self.clear_force_control_k()
+            self._update_force_frame_mapping_lock()
+        self.static_full_auto_recording = False
+
+    def _abort_static_full_setup(self, reason: str) -> None:
+        self.static_full_setup_stage = ""
+        self._static_full_profile_wait = False
+        self._static_full_pending_resume = None
+        self._static_full_pending_targets = []
+        if self.mini45_precomp_active:
+            self.finish_mini45_precomp(reason)
+        if self.k_ident_active:
+            self.abort_k_identification(reason)
+        try:
+            if self.motion:
+                self.motion.stop_all()
+        except Exception:
+            pass
+        self._close_static_full_recording()
+        self.static_full_status.setText(f"自动准备失败：{reason}")
+        self._log(f"全静态标定自动准备失败：{reason}")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+
+    def _static_full_parameters(self) -> dict:
+        enabled_flows = self._static_full_enabled_flows()
+        flow_cycles = self._static_full_flow_cycle_values()
+        legacy_cycles = max((flow_cycles[flow] for flow in enabled_flows), default=3)
+        shear_flows_enabled = bool(set(enabled_flows) & {"fx", "fy", "diagonal"})
+        return {
+            "fz_max": self.static_full_fz_max.value(),
+            "fz_step": self.static_full_fz_step.value(),
+            "preload_levels": parse_force_levels(self.static_full_preload_levels.text()) if shear_flows_enabled else [0.0],
+            "shear_max": self.static_full_shear_max.value(),
+            "shear_step": self.static_full_shear_step.value(),
+            "angles_deg": parse_angles_deg(self.static_full_angles.text()) if "diagonal" in enabled_flows else [],
+            "cycles": legacy_cycles,
+            "enabled_flows": enabled_flows,
+            "flow_cycles": flow_cycles,
+            "required_cap_samples": self._static_full_required_cap_samples(),
+        }
+
+    def _static_full_targets_from_parameters(self, parameters: dict) -> list[CalibrationTarget]:
+        cycles = int(parameters.get("cycles", 3))
+        enabled_flows = parameters.get("enabled_flows")
+        flow_cycles = parameters.get("flow_cycles")
+        return generate_static_full_sequence(
+            fz_max=float(parameters["fz_max"]),
+            fz_step=float(parameters["fz_step"]),
+            preload_levels=[float(value) for value in parameters["preload_levels"]],
+            shear_max=float(parameters["shear_max"]),
+            shear_step=float(parameters["shear_step"]),
+            diagonal_angles_deg=[float(value) for value in parameters["angles_deg"]],
+            cycles=cycles,
+            enabled_flows=enabled_flows,
+            flow_cycles=flow_cycles,
+        )
+
+    def _save_static_full_checkpoint(self, status: str, note: str = "") -> None:
+        if not self.recorder:
+            return
+        if self.static_full_retest_active:
+            self.recorder.update_static_full_retest_manifest(
+                status=status,
+                note=note,
+                sequence_index=self.sequence_index,
+                completed_points=self.static_full_points_completed,
+                invalid_points=self.static_full_points_invalid,
+            )
+            return
+        targets = self.sequence_targets or self._static_full_pending_targets
+        if not targets:
+            return
+        mapping = self.current_force_frame_mapping().as_row("", self.experiment_id.text().strip() or "exp001")
+        payload = {
+            "status": status,
+            "note": note,
+            "experiment_id": self.experiment_id.text().strip() or "exp001",
+            "parameters": self._static_full_parameters(),
+            "targets": [asdict(target) for target in targets],
+            "sequence_index": self.sequence_index,
+            "completed_points": self.static_full_points_completed,
+            "invalid_points": self.static_full_points_invalid,
+            "marker_id": self.marker_id,
+            "force_frame_mapping": mapping,
+            "force_control_result": asdict(self.force_control_result) if self.force_control_result else None,
+            "mini45_precomp": {
+                "enabled": self.mini45_precomp_enabled,
+                "quality": self.mini45_precomp_quality,
+                "bias": dict(self.mini45_precomp_bias),
+            },
+        }
+        try:
+            self.recorder.flush()
+            save_checkpoint(self.recorder.output_dir, payload)
+        except Exception as exc:
+            self._log(f"全静态检查点保存失败：{exc}")
+
+    def _checkpoint_mapping_matches(self, saved: dict | None) -> bool:
+        if not saved:
+            return True
+        current = self.current_force_frame_mapping().as_row("", "")
+        keys = (
+            "sensor_Fx_from", "sensor_Fx_sign",
+            "sensor_Fy_from", "sensor_Fy_sign",
+            "sensor_Fz_from", "sensor_Fz_sign",
+        )
+        return all(str(current.get(key)) == str(saved.get(key)) for key in keys)
+
+    def resume_static_full_from_folder(self) -> None:
+        if self._static_full_busy() or self.workflow.active or self.k_ident_active or self._calibration_active():
+            QMessageBox.warning(self, "继续全静态标定", "当前已有实验或标定流程正在运行")
+            return
+        folder_text = QFileDialog.getExistingDirectory(self, "选择已有全静态实验目录", self.output_dir.text())
+        if not folder_text:
+            return
+        if self.recorder:
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
+            self.recorder = None
+            self.static_full_auto_recording = False
+            self.record_btn.setText("开始实验批次")
+            self.record_status.setText("未开始实验批次")
+            self.clear_force_control_k()
+            self._update_force_frame_mapping_lock()
+            self._log("继续已有全静态实验前已关闭当前空闲实验批次")
+        folder = Path(folder_text)
+        try:
+            if checkpoint_path(folder).exists():
+                document = load_checkpoint(folder)
+                targets = [CalibrationTarget(**row) for row in document["targets"]]
+            else:
+                parameters = self._static_full_parameters()
+                targets = self._static_full_targets_from_parameters(parameters)
+                completed = legacy_completed_point_count(folder)
+                document = {
+                    "status": "legacy",
+                    "parameters": parameters,
+                    "targets": [asdict(target) for target in targets],
+                    "sequence_index": completed,
+                    "completed_points": completed,
+                    "invalid_points": 0,
+                    "marker_id": legacy_last_marker_id(folder),
+                    "force_frame_mapping": load_last_force_mapping(folder),
+                    "force_control_result": None,
+                    "mini45_precomp": None,
+                }
+                QMessageBox.information(
+                    self,
+                    "继续全静态标定",
+                    f"目录中没有新版检查点，将按当前页面参数和已有记录 {completed} 点，"
+                    f"从第 {completed + 1} 点继续。请确认页面参数与原实验一致。",
+                )
+            safety = SafetySettings()
+            validate_force_targets(targets, (safety.fx_abs_max_n, safety.fy_abs_max_n, safety.fz_abs_max_n))
+            sequence_index = int(document.get("sequence_index", 0))
+            if sequence_index < 0 or sequence_index >= len(targets):
+                raise ValueError(f"检查点进度 {sequence_index} 不在目标序列范围内（共 {len(targets)} 点）")
+            if not self._checkpoint_mapping_matches(document.get("force_frame_mapping")):
+                raise ValueError("当前传感器坐标映射与原实验不一致")
+            saved_parameters = document.get("parameters")
+            if isinstance(saved_parameters, dict):
+                self._apply_static_full_parameters(saved_parameters)
+        except Exception as exc:
+            QMessageBox.warning(self, "继续全静态标定", f"无法读取已有实验：{exc}")
+            return
+        if not self._devices_ready(require_k=False):
+            return
+
+        k_payload = document.get("force_control_result")
+        try:
+            restored_k = KIdentificationResult(**k_payload) if isinstance(k_payload, dict) else load_last_valid_k_result(folder)
+        except Exception:
+            restored_k = None
+        if not restored_k or not restored_k.valid:
+            QMessageBox.warning(self, "继续全静态标定", "已有实验中没有可恢复的有效 K 辨识结果")
+            return
+        precomp_payload = document.get("mini45_precomp")
+        if isinstance(precomp_payload, dict) and precomp_payload.get("enabled"):
+            restored_bias = {field: float(precomp_payload["bias"][field]) for field in ZERO_BIAS}
+            restored_quality = str(precomp_payload.get("quality") or "warning")
+        else:
+            legacy_precomp = load_latest_precomp(folder)
+            if not legacy_precomp:
+                QMessageBox.warning(self, "继续全静态标定", "已有实验中没有可恢复的 Mini45 预补偿结果")
+                return
+            restored_bias, restored_quality = legacy_precomp
+
+        try:
+            recorder = CsvRecorder(folder)
+            recorder.start(resume=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "继续全静态标定", f"无法追加打开已有实验文件：{exc}")
+            return
+        self.recorder = recorder
+        self.static_full_auto_recording = True
+        self.record_btn.setText("结束实验批次")
+        self.record_status.setText(str(folder))
+        self.output_dir.setText(str(folder.parent))
+        self.force_control_result = restored_k
+        self.force_control_state = DecoupledControlState()
+        self.update_k_display(restored_k)
+        self.mini45_precomp_enabled = True
+        self.mini45_precomp_active = False
+        self.mini45_precomp_bias = dict(restored_bias)
+        self.mini45_precomp_quality = restored_quality
+        self.mini45_precomp_status.setText(
+            f"预补偿：已从已有实验恢复（{restored_quality}）\n"
+            f"{self._mini45_precomp_bias_text(self.mini45_precomp_bias)}"
+        )
+        self.marker_id = int(document.get("marker_id", 0))
+        self._static_full_pending_targets = targets
+        self._static_full_pending_resume = {
+            "sequence_index": sequence_index,
+            "completed_points": int(document.get("completed_points", sequence_index)),
+            "invalid_points": int(document.get("invalid_points", 0)),
+        }
+        self.buffer.clear()
+        self.reset_force_filter(log=False)
+        self._update_force_frame_mapping_lock()
+        self._log(
+            f"已加载全静态检查点：{folder}，将从第 {sequence_index + 1}/{len(targets)} 点继续；"
+            "K 与 Mini45 预补偿已恢复"
+        )
+        self._start_static_full_profile_wait()
+
+    def _static_full_begin(self) -> None:
+        """配置就绪后启动全静态序列。"""
+        targets = list(self._static_full_pending_targets)
+        resume = self._static_full_pending_resume
+        self._static_full_pending_targets = []
+        self._static_full_pending_resume = None
+        self.static_full_setup_stage = ""
+        self.static_full_active = True
+        self.static_full_paused = False
+        self.static_full_returning_zero = False
+        self.static_full_recovering_mini45 = False
+        self.static_full_recovering_esp32 = False
+        self.static_full_points_completed = int(resume["completed_points"]) if resume else 0
+        self.static_full_points_invalid = int(resume["invalid_points"]) if resume else 0
+        self.sequence_targets = targets
+        self.sequence_index = int(resume["sequence_index"]) if resume else 0
+        self.calibration_mode = "static_full"
+        self.calibration_paused = False
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        if resume:
+            self.static_full_status.setText(
+                f"已恢复 — 从第 {self.sequence_index + 1}/{len(targets)} 个标定点继续"
+            )
+            self._log(f"全静态标定恢复运行：从第 {self.sequence_index + 1}/{len(targets)} 点继续")
+        else:
+            self.static_full_status.setText(f"运行中 — 共 {len(targets)} 个标定点")
+            self._log(f"全静态标定开始：共 {len(targets)} 个标定点")
+        self._save_static_full_checkpoint("running", "恢复运行" if resume else "开始运行")
+        self.start_next_sequence_target()
+
+    def pause_static_full(self) -> None:
+        if not self.static_full_active or self.static_full_paused or self.static_full_returning_zero:
+            return
+        self.static_full_paused = True
+        self.calibration_paused = True
+        self.stop_auto_force("暂停")
+        self._save_static_full_checkpoint("paused", "用户暂停")
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self.static_full_status.setText("已暂停")
+        self._log("全静态标定已暂停")
+
+    def resume_static_full(self) -> None:
+        if not self.static_full_active or not self.static_full_paused:
+            return
+        if self.force_zero_active:
+            return
+        self.static_full_paused = False
+        self.calibration_paused = False
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self.static_full_status.setText(
+            f"运行中 — {self.sequence_index}/{len(self.sequence_targets)}"
+        )
+        self._log("全静态标定继续")
+        self.start_next_sequence_target()
+
+    def stop_static_full(self, reason: str = "人工停止") -> None:
+        if self.static_full_retest_active:
+            self.stop_static_full_retest(reason)
+            return
+        if not self._static_full_busy():
+            return
+        self._save_static_full_checkpoint("stopped", reason)
+        self.static_full_setup_stage = ""
+        self._static_full_profile_wait = False
+        self._static_full_pending_resume = None
+        self._static_full_pending_targets = []
+        if self.mini45_precomp_active:
+            self.finish_mini45_precomp(reason)
+        if self.k_ident_active:
+            self.abort_k_identification(reason)
+        self.stop_auto_force(reason)
+        self.static_full_active = False
+        self.static_full_paused = False
+        self.static_full_returning_zero = False
+        self.static_full_recovering_mini45 = False
+        self.static_full_recovering_esp32 = False
+        self.mini_btn.setEnabled(True)
+        self.mini_btn.setText("断开 Mini45" if self.mini45 else "连接 Mini45")
+        self.esp_btn.setEnabled(True)
+        self.esp_btn.setText("断开 ESP32" if self.esp32 else "连接 ESP32")
+        self.calibration_mode = ""
+        self.calibration_paused = False
+        self.static_point_collector = None
+        self.sequence_targets = []
+        self.sequence_index = 0
+        self.active_target = None
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self.static_full_status.setText(f"已停止：{reason}")
+        self._log(f"全静态标定停止：{reason}，完成 {self.static_full_points_completed} 点")
+        self._close_static_full_recording()
+
+    def _finish_static_full(self) -> None:
+        if self.static_full_retest_active:
+            self._finish_static_full_retest()
+            return
+        total = len(self.sequence_targets)
+        self._save_static_full_checkpoint("completed", "全部标定点完成并已回零")
+        self.stop_auto_force("")
+        self.static_full_active = False
+        self.static_full_paused = False
+        self.static_full_returning_zero = False
+        self.static_full_recovering_mini45 = False
+        self.static_full_recovering_esp32 = False
+        self.static_full_setup_stage = ""
+        self.esp_btn.setEnabled(True)
+        self.esp_btn.setText("断开 ESP32" if self.esp32 else "连接 ESP32")
+        self.calibration_mode = ""
+        self.calibration_paused = False
+        self.static_point_collector = None
+        self.active_target = None
+        self.sequence_targets = []
+        self.sequence_index = 0
+        self._update_static_full_buttons()
+        self._update_calibration_buttons()
+        self.static_full_status.setText(
+            f"完成 — {self.static_full_points_completed} 有效 / "
+            f"{self.static_full_points_invalid} 无效 / "
+            f"共 {total} 点，已自动卸载回零"
+        )
+        self.cal_status.setText("标定状态：全静态标定完成，已卸载回零")
+        self._log(
+            f"全静态标定完成：{self.static_full_points_completed} 有效，"
+            f"{self.static_full_points_invalid} 无效"
+        )
+        self._close_static_full_recording()
+
+    def _update_static_full_estimate(self, *args: object) -> None:
+        """参数变化时实时更新预估标定时间。"""
+        if self.static_full_active:
+            return
+        try:
+            targets = self._static_full_targets_from_parameters(self._static_full_parameters())
+        except Exception:
+            self.static_full_estimate.setText("参数无效")
+            self.static_full_estimate.setStyleSheet("font-weight: bold; color: #C62828;")
+            return
+
+        n = len(targets)
+        collector = StaticPointCollector(required_cap_samples=self._static_full_required_cap_samples())
+        seconds_per_point = collector.stable_hold_s + collector.required_cap_samples / STATIC_PRECISION.nominal_hz
+        total_s = n * seconds_per_point
+        if total_s < 3600:
+            minutes = total_s / 60
+            text = f"{n} 点 ≈ {minutes:.0f} 分钟"
+        else:
+            hours = total_s / 3600
+            text = f"{n} 点 ≈ {hours:.1f} 小时"
+
+        fz_n = sum(1 for t in targets if t.axis == "Fz")
+        fx_n = sum(1 for t in targets if t.axis == "Fx")
+        fy_n = sum(1 for t in targets if t.axis == "Fy")
+        diag_n = n - fz_n - fx_n - fy_n
+        parts = []
+        if fz_n:
+            parts.append(f"Fz单轴 {fz_n}")
+        if fx_n:
+            parts.append(f"Fx预载 {fx_n}")
+        if fy_n:
+            parts.append(f"Fy预载 {fy_n}")
+        if diag_n:
+            parts.append(f"斜向 {diag_n}")
+        detail = " + ".join(parts) if parts else "未选择流程"
+        text += f"（{detail}；不含运动与重试）"
+
+        self.static_full_estimate.setText(text)
+        self.static_full_estimate.setStyleSheet("font-weight: bold; color: #1565C0;")
+
+    @staticmethod
+    def _static_full_phase_name(target: CalibrationTarget | None) -> str:
+        if target is None:
+            return "—"
+        if target.branch == "return_zero":
+            return "结束卸载回零"
+        axis = target.axis
+        if axis == "Fz":
+            return "Fz 单轴标定"
+        if axis == "Fx":
+            return f"Fx 单轴加载 @ Fz={target.target_fz:.0f}N"
+        if axis == "Fy":
+            return f"Fy 单轴加载 @ Fz={target.target_fz:.0f}N"
+        # combined: diagonal
+        return f"斜向加载 {target.direction} @ Fz={target.target_fz:.0f}N"
+
+    def _update_static_full_progress(self) -> None:
+        if not self.static_full_active or self.static_full_recovering_mini45:
+            return
+        target = self.active_target
+        collector = self.static_point_collector
+        total = len(self.sequence_targets)
+        idx = self.sequence_index
+
+        # Build status lines
+        lines = []
+        lines.append(f"【{self._static_full_phase_name(target)}】")
+        if target:
+            lines.append(
+                f"目标: Fx={target.target_fx:+.3f}  Fy={target.target_fy:+.3f}  "
+                f"Fz={target.target_fz:+.3f} N  |  "
+                f"{target.branch} / {target.direction}  |  "
+                f"第 {target.cycle_index} 组"
+            )
+
+        if collector is not None:
+            cap_n = len(collector.cap_samples)
+            cap_total = collector.required_cap_samples
+            if collector.complete:
+                cap_text = f"电容: {cap_n}/{cap_total} ✓ 完成，等待质量判定…"
+            elif collector.collecting and not collector.collection_paused:
+                cap_text = f"电容: {cap_n}/{cap_total}  采集中"
+            elif collector.collection_paused:
+                cap_text = f"电容: {cap_n}/{cap_total}  暂停（力越界，等待恢复）"
+            elif collector.in_window_since_s > 0:
+                stable_s = collector.stable_elapsed_s
+                cap_text = f"稳定保持中… {stable_s:.1f}s / {collector.stable_hold_s:.0f}s"
+            else:
+                cap_text = "等待力进入目标窗口…"
+            if collector.retry_count > 0:
+                cap_text += f"  [重试 {collector.retry_count}/{collector.max_retries}]"
+            lines.append(cap_text)
+        elif self.auto_force_active:
+            lines.append("力控逼近中…")
+
+        if self.static_full_returning_zero:
+            lines.append(
+                f"进度: 标定点已完成，正在自动卸载回零  |  "
+                f"有效 {self.static_full_points_completed}  |  无效 {self.static_full_points_invalid}"
+            )
+        else:
+            lines.append(
+                f"进度: 点 {idx + 1}/{total}  |  "
+                f"已完成 {self.static_full_points_completed}  |  "
+                f"无效 {self.static_full_points_invalid}"
+            )
+        self.static_full_status.setText("\n".join(lines))
+
+    def _update_static_full_profile_switch(self) -> None:
+        """检测全静态标定的 CAP 配置切换是否就绪。"""
+        if not getattr(self, "_static_full_profile_wait", False):
+            return
+        target_profile = STATIC_PRECISION.name
+        if self._profile_is_ready(target_profile):
+            self._static_full_profile_wait = False
+            if self.static_full_setup_stage == "retest_profile":
+                self._static_full_retest_begin()
+            else:
+                self._static_full_begin()
+            return
+        elapsed = time.monotonic() - self._static_full_profile_start_s
+        if elapsed > 15.0:
+            self._static_full_profile_wait = False
+            QMessageBox.warning(
+                self, "全静态标定",
+                f"MC1081 配置切换超时（{target_profile}），请检查 ESP32 连接和 CAP 流"
+            )
+            self._log(f"全静态标定：等待 {target_profile} 配置超时")
+            if self.static_full_setup_stage == "retest_profile":
+                self.stop_static_full_retest(f"{target_profile} 配置切换超时")
+            else:
+                self._abort_static_full_setup(f"{target_profile} 配置切换超时")
+
     def _training_devices_ready(self) -> bool:
         if not self.esp32:
             QMessageBox.warning(self, "训练数据采集", "请先连接 ESP32 电容采集串口")
@@ -1863,6 +3655,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "训练数据采集", "请先连接 Arduino 电机控制串口")
             return False
         return True
+
+    def _new_static_point_collector(self) -> StaticPointCollector:
+        if self.calibration_mode in {"static_full", "static_full_retest"}:
+            return StaticPointCollector(required_cap_samples=self._static_full_required_cap_samples())
+        return StaticPointCollector()
 
     def _build_sequence_targets(self) -> list[CalibrationTarget]:
         axis = self._combo_value(self.load_axis)
@@ -1889,6 +3686,9 @@ class MainWindow(QMainWindow):
 
     def start_next_sequence_target(self) -> None:
         if self.sequence_index >= len(self.sequence_targets):
+            if self.calibration_mode in {"static_full", "static_full_retest"}:
+                self._start_static_full_return_zero()
+                return
             self.stop_auto_force("")
             self.calibration_mode = ""
             self.static_point_collector = None
@@ -1898,19 +3698,61 @@ class MainWindow(QMainWindow):
                 self.stop_calibration("静态正反程标定完成")
             return
         self.active_target = self.sequence_targets[self.sequence_index]
-        if self.workflow.active and self.workflow.stage == "static_sequence":
-            self.static_point_collector = StaticPointCollector()
+        _use_collector = (
+            (self.workflow.active and self.workflow.stage == "static_sequence")
+            or self.calibration_mode in {"static_full", "static_full_retest"}
+        )
+        if _use_collector:
+            self.static_point_collector = self._new_static_point_collector()
             self.static_point_collector.begin(time.monotonic())
         else:
             self.static_point_collector = None
         self._apply_target_to_ui(self.active_target)
-        self.cal_status.setText(f"标定状态：正反程点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
+        if self.calibration_mode == "static_full_retest" and self.recorder:
+            self.recorder.set_static_full_retest_source(
+                source_point_index=self.active_target.point_index,
+                source_cycle_id=f"cycle_{self.active_target.cycle_index:03d}",
+            )
+        if self.calibration_mode == "static_full_retest":
+            label = "补测"
+        elif self.calibration_mode == "static_full":
+            label = "全静态"
+        else:
+            label = "正反程"
+        self.cal_status.setText(f"标定状态：{label}点 {self.sequence_index + 1}/{len(self.sequence_targets)}")
         if not self.start_auto_force():
             self.static_point_collector = None
             if self.workflow.active and self.workflow.stage == "static_sequence":
                 self.abort_full_workflow("静态正反程标定力控启动失败")
+            elif self.calibration_mode in {"static_full", "static_full_retest"}:
+                self.stop_static_full("全静态标定力控启动失败")
             else:
                 self.stop_calibration("启动失败")
+
+    def _start_static_full_return_zero(self) -> None:
+        """After the final calibration point, unload all three axes to zero."""
+        self.stop_auto_force("")
+        self.static_point_collector = None
+        self.static_full_returning_zero = True
+        if self.calibration_mode == "static_full_retest" and self.recorder:
+            self.recorder.set_static_full_retest_source()
+        self.active_target = CalibrationTarget(
+            "combined",
+            "none",
+            "return_zero",
+            0.0,
+            0.0,
+            0.0,
+            max((int(target.cycle_index) for target in self.sequence_targets), default=1),
+            len(self.sequence_targets) + 1,
+        )
+        self._apply_target_to_ui(self.active_target)
+        self.static_full_status.setText("标定点已完成，正在自动卸载回零…")
+        self._log("全静态标定点已完成，开始自动卸载回零")
+        self._save_static_full_checkpoint("returning_zero", "标定点完成，正在卸载回零")
+        self._update_static_full_buttons()
+        if not self.start_auto_force():
+            self.stop_static_full("自动卸载回零启动失败")
 
     def _apply_target_to_ui(self, target: CalibrationTarget) -> None:
         self._set_combo_by_data(self.load_axis, target.axis)
@@ -2089,6 +3931,9 @@ class MainWindow(QMainWindow):
         )
 
     def pause_calibration(self) -> None:
+        if self.static_full_active:
+            self.pause_static_full()
+            return
         if not self._calibration_active():
             return
         self.calibration_paused = True
@@ -2105,6 +3950,11 @@ class MainWindow(QMainWindow):
         self._update_calibration_buttons()
 
     def resume_calibration(self) -> None:
+        if self.force_zero_active:
+            return
+        if self.static_full_active and self.static_full_paused:
+            self.resume_static_full()
+            return
         if not self.calibration_mode:
             return
         if self.training_active and self.training_pause_started_s > 0.0:
@@ -2128,6 +3978,9 @@ class MainWindow(QMainWindow):
             self.stop_calibration("已跳过当前点")
 
     def stop_calibration(self, reason: str = "") -> None:
+        if self._static_full_busy():
+            self.stop_static_full(reason or "停止")
+            return
         if self.training_active:
             self.finish_training_collection(reason or "停止")
         if self.zero_drift_active:
@@ -2218,7 +4071,13 @@ class MainWindow(QMainWindow):
 
     def stop_auto_force(self, reason: str = "") -> None:
         if not self.auto_force_active and not self.auto_force_holding:
+            force_zero_was_active = self.force_zero_active
+            self.force_zero_active = False
+            if force_zero_was_active:
+                self._update_calibration_buttons()
             return
+        force_zero_was_active = self.force_zero_active
+        self.force_zero_active = False
         self.auto_force_active = False
         self.auto_force_holding = False
         self.auto_force_marker_done = False
@@ -2231,18 +4090,43 @@ class MainWindow(QMainWindow):
         if reason:
             self.motion_status.setText(f"电机状态：自动停止，{reason}")
             self._log(f"自动逼近停止：{reason}")
+            if force_zero_was_active:
+                self.cal_status.setText(f"标定状态：力归0/卸载已停止：{reason}")
         self._update_calibration_buttons()
 
     def _fail_auto_force(self, reason: str) -> None:
         """自动流程中的力控故障必须终止整套实验，手动模式只停止当前力控。"""
+        if self.force_zero_active:
+            self.force_zero_active = False
+            self.stop_auto_force(reason)
+            self.calibration_paused = bool(
+                self.training_active
+                or self.static_full_active
+                or self.calibration_mode
+                or self.workflow.active
+            )
+            self.cal_status.setText(f"标定状态：力归0/卸载失败：{reason}，保持暂停")
+            self._log(f"力归0/卸载失败：{reason}，流程保持暂停")
+            self._update_static_full_buttons()
+            self._update_workflow_ui()
+            self._update_calibration_buttons()
+            return
         if self.workflow.active:
             self.abort_full_workflow(reason)
+        elif self._static_full_busy():
+            if self.static_full_active and "Mini45" in reason and ("未更新" in reason or "断开" in reason):
+                self._begin_static_full_mini45_recovery(reason)
+            else:
+                self.stop_static_full(reason)
         else:
             self.stop_auto_force(reason)
 
     def toggle_recording(self) -> None:
         if self.recorder:
-            if self.training_active or self.zero_drift_active or self.auto_force_active:
+            if self._static_full_busy():
+                self.stop_static_full("实验批次结束")
+                return
+            elif self.training_active or self.zero_drift_active or self.auto_force_active:
                 self.stop_calibration("实验批次结束")
             self.recorder.stop()
             self.recorder = None
@@ -2316,7 +4200,7 @@ class MainWindow(QMainWindow):
 
     def _update_static_point_collection(self) -> None:
         collector = self.static_point_collector
-        if self.calibration_mode != "sequence" or not collector or not self.active_target or self.calibration_paused:
+        if not is_static_collection_mode(self.calibration_mode) or not collector or not self.active_target or self.calibration_paused:
             return
         now = time.monotonic()
         meta = self._meta()
@@ -2406,12 +4290,22 @@ class MainWindow(QMainWindow):
                     point.timestamp_end = selected_caps[-1].timestamp
                     self.recorder.write_calibration_point(point)
             if final_result.stable:
-                self.workflow.completed_static_points += 1
+                if self.workflow.active:
+                    self.workflow.completed_static_points += 1
+                if self.calibration_mode in {"static_full", "static_full_retest"}:
+                    self.static_full_points_completed += 1
                 self._write_workflow_event("static_point_complete", "complete")
             else:
-                self.workflow.invalid_static_points += 1
+                if self.workflow.active:
+                    self.workflow.invalid_static_points += 1
+                if self.calibration_mode in {"static_full", "static_full_retest"}:
+                    self.static_full_points_invalid += 1
                 self._write_workflow_event("static_point_complete", "invalid", final_result.reject_reason)
+            if self.static_full_active:
+                self._update_static_full_progress()
             self.sequence_index += 1
+            if self.static_full_active:
+                self._save_static_full_checkpoint("running", "静态点完成")
             self.stop_auto_force("")
             self.static_point_collector = None
             self.start_next_sequence_target()
@@ -2428,17 +4322,27 @@ class MainWindow(QMainWindow):
                 invalid_meta.note = f"{invalid_meta.note}; static_point_timeout" if invalid_meta.note else "static_point_timeout"
                 if self.recorder:
                     self.recorder.write_marker(self.marker_id, invalid_meta)
-                self.workflow.invalid_static_points += 1
+                if self.workflow.active:
+                    self.workflow.invalid_static_points += 1
+                if self.calibration_mode in {"static_full", "static_full_retest"}:
+                    self.static_full_points_invalid += 1
                 self._write_workflow_event("static_point_skipped", "invalid", "重试两次后仍超时")
+                if self.static_full_active:
+                    self._update_static_full_progress()
                 self.sequence_index += 1
+                if self.static_full_active:
+                    self._save_static_full_checkpoint("running", "静态点超时后跳过")
                 self.stop_auto_force("")
                 self.static_point_collector = None
                 self.start_next_sequence_target()
 
     def _tick(self) -> None:
+        tick_started_s = time.perf_counter()
         self._drain_esp32()
         self._drain_mini45()
         self._drain_motion()
+        self._update_static_full_mini45_recovery()
+        self._update_static_full_esp32_recovery()
         if self.mini45_precomp_active and self.mini45_precomp_start_monotonic_s is not None:
             elapsed = max(0.0, time.monotonic() - self.mini45_precomp_start_monotonic_s)
             self.mini45_precomp_status.setText(
@@ -2448,6 +4352,26 @@ class MainWindow(QMainWindow):
             if elapsed >= self.mini45_precomp_duration_s:
                 self.finish_mini45_precomp()
         self._update_k_identification()
+        self._update_static_full_profile_switch()
+        if self._static_full_profile_wait and not self.esp32:
+            self.stop_static_full("ESP32 已断开")
+        elif (
+            self.static_full_active
+            and not self.esp32
+            and not self.static_full_recovering_mini45
+            and not self.static_full_recovering_esp32
+        ):
+            self._begin_static_full_esp32_recovery("ESP32 已断开")
+        elif (
+            self.static_full_active
+            and not self.static_full_recovering_mini45
+            and not self.static_full_recovering_esp32
+            and self.last_cap_time > 0.0
+            and time.monotonic() - self.last_cap_time > 5.0
+        ):
+            self._begin_static_full_esp32_recovery("ESP32 电容数据超过 5 秒未更新")
+        elif self.static_full_active and not self.static_full_recovering_esp32:
+            self._update_static_full_progress()
         if self.zero_drift_active and not self.calibration_paused and time.monotonic() - self.zero_drift_start_s >= self.zero_duration_s.value():
             self.finish_zero_drift("完成")
         self._update_calibration_progress_status()
@@ -2456,6 +4380,7 @@ class MainWindow(QMainWindow):
         self._update_static_point_collection()
         self._update_full_workflow()
         self._update_status()
+        self._flush_plot_updates(tick_started_s)
 
     def _update_calibration_progress_status(self) -> None:
         now = time.monotonic()
@@ -2621,7 +4546,7 @@ class MainWindow(QMainWindow):
         for axis in ("X", "Y", "Z"):
             value = self.motion_positions.get(axis)
             parts.append(f"{axis}={value:.4f} mm" if value is not None else f"{axis}=--")
-        prefix = "自动逼近中" if self.auto_force_active else "已连接"
+        prefix = "力归0/卸载中" if self.force_zero_active else ("自动逼近中" if self.auto_force_active else "已连接")
         self.motion_status.setText(f"电机状态：{prefix}，" + "，".join(parts))
 
     def _update_auto_force(self) -> None:
@@ -2630,7 +4555,7 @@ class MainWindow(QMainWindow):
         if not self.motion:
             self._fail_auto_force("Arduino 未连接")
             return
-        if self.calibration_paused:
+        if self.calibration_paused and not self.force_zero_active:
             return
         if not self.latest_force_sample or self.last_force_time <= 0.0:
             return
@@ -2657,6 +4582,9 @@ class MainWindow(QMainWindow):
         all_in_window = all(abs(error[index]) <= tolerances[index] for index in range(3))
 
         if all_in_window:
+            if self.force_zero_active:
+                self._finish_force_zero_unload()
+                return
             if self.training_active:
                 # 训练采集由 _update_training_collection 负责到达后立即切换目标，
                 # 这里不停车等待，避免连续加载数据出现人为停顿。
@@ -2666,7 +4594,11 @@ class MainWindow(QMainWindow):
                 self.calibration_mode = ""
                 self._advance_workflow()
                 return
-            if self.calibration_mode == "sequence" and self.static_point_collector:
+            if self.static_full_active and self.static_full_returning_zero:
+                self.stop_auto_force("")
+                self._finish_static_full()
+                return
+            if is_static_collection_mode(self.calibration_mode) and self.static_point_collector:
                 if not self.auto_force_holding:
                     self.auto_force_holding = True
                     try:
@@ -2805,6 +4737,20 @@ class MainWindow(QMainWindow):
             self.mini_status.setText("Mini45 状态：数据超过 1 秒未更新")
 
     def _meta(self) -> ExperimentMeta:
+        if self.force_zero_active:
+            note = self.note.text().strip()
+            return ExperimentMeta(
+                experiment_id=self.experiment_id.text().strip() or "exp001",
+                cycle_id=self.current_cycle_id,
+                branch="force_zero",
+                axis="combined",
+                direction="unload",
+                preload_n=0.0,
+                target_fx=0.0,
+                target_fy=0.0,
+                target_fz=0.0,
+                note=f"{note}; force_zero_unload" if note else "force_zero_unload",
+            )
         if self.training_active and self.active_target:
             return ExperimentMeta(
                 experiment_id=self.experiment_id.text().strip() or "exp001",
@@ -2858,44 +4804,55 @@ class MainWindow(QMainWindow):
         )
 
     def _add_force_plot(self, sample: ForceSample) -> None:
-        if self._plot_updates_suspended():
-            if sample.monotonic_s - self.last_force_plot_update_s >= 0.25:
-                self.last_force_plot_update_s = sample.monotonic_s
-                self._update_force_value_labels(sample)
-            return
         x = sample.monotonic_s
         self.force_x.append(x)
         for key in self.force_y:
             self.force_y[key].append(getattr(sample, key))
         self._trim_plot(self.force_x, self.force_y)
-        if sample.monotonic_s - self.last_force_plot_update_s < 0.10:
-            return
-        self.last_force_plot_update_s = sample.monotonic_s
-        for key, curve in self.force_curves.items():
-            curve.setData(self.force_x, self.force_y[key])
-        self._update_force_value_labels(sample)
+        self.force_plot_dirty = True
+        self.pending_force_plot_sample = sample
 
     def _update_force_value_labels(self, sample: ForceSample) -> None:
         for label, attr in (("Fx", "fx"), ("Fy", "fy"), ("Fz", "fz"), ("Mx", "mx"), ("My", "my"), ("Mz", "mz")):
             self.value_labels[label].setText(f"{getattr(sample, attr):.4f}")
 
     def _add_cap_plot(self, sample: CapSample) -> None:
-        if self._plot_updates_suspended():
-            if sample.monotonic_s - self.last_cap_plot_update_s >= 0.25:
-                self.last_cap_plot_update_s = sample.monotonic_s
-                self._update_cap_value_labels(sample)
-            return
         x = sample.monotonic_s
         self.cap_x.append(x)
         for key in self.cap_y:
             self.cap_y[key].append(getattr(sample, key))
         self._trim_plot(self.cap_x, self.cap_y)
-        if sample.monotonic_s - self.last_cap_plot_update_s < 0.10:
+        self.cap_plot_dirty = True
+        self.pending_cap_plot_sample = sample
+
+    def _flush_plot_updates(self, tick_started_s: float | None = None) -> None:
+        now_wall_s = time.perf_counter()
+        if tick_started_s is not None and now_wall_s - tick_started_s >= self.plot_tick_budget_s:
             return
-        self.last_cap_plot_update_s = sample.monotonic_s
-        for key, curve in self.cap_curves.items():
-            curve.setData(self.cap_x, self.cap_y[key])
-        self._update_cap_value_labels(sample)
+        if now_wall_s - self.last_plot_flush_wall_s < self.plot_flush_interval_s:
+            return
+
+        flushed = False
+        if self.force_plot_dirty:
+            for key, curve in self.force_curves.items():
+                curve.setData(self.force_x, self.force_y[key])
+            if self.pending_force_plot_sample is not None:
+                self._update_force_value_labels(self.pending_force_plot_sample)
+            self.force_plot_dirty = False
+            self.pending_force_plot_sample = None
+            flushed = True
+
+        if self.cap_plot_dirty:
+            for key, curve in self.cap_curves.items():
+                curve.setData(self.cap_x, self.cap_y[key])
+            if self.pending_cap_plot_sample is not None:
+                self._update_cap_value_labels(self.pending_cap_plot_sample)
+            self.cap_plot_dirty = False
+            self.pending_cap_plot_sample = None
+            flushed = True
+
+        if flushed:
+            self.last_plot_flush_wall_s = now_wall_s
 
     def _update_cap_value_labels(self, sample: CapSample) -> None:
         for label, attr in (("C0", "c0"), ("C1", "c1"), ("C2", "c2"), ("C3", "c3"), ("C4", "c4")):
